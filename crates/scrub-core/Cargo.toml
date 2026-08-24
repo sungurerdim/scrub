@@ -8,6 +8,13 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+# Forces blake3's portable Rust implementation instead of its hand-written
+# assembly. Used only by `scripts/check.sh` to type-check Windows targets on a
+# machine that has no MSVC assembler. Never enabled in a shipped build: the
+# assembly path is several times faster and hashing is this tool's hot loop.
+portable-hash = ["blake3/pure"]
+
 [dependencies]
 blake3.workspace = true
 serde.workspace = true

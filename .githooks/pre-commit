@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Runs the quality gate before every commit, so "done" is a machine's verdict
+# rather than an author's. Enable it once per clone:
+#
+#   git config core.hooksPath .githooks
+#
+# To commit past a red gate deliberately (a work-in-progress branch, a revert):
+#
+#   git commit --no-verify
+
+set -euo pipefail
+exec "$(git rev-parse --show-toplevel)/scripts/check.sh"

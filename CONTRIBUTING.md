@@ -34,11 +34,52 @@ boundary.
 
 ## Development
 
+One command runs everything, on your machine, with no network and no CI:
+
 ```bash
-cargo test --workspace          # unit and golden-file tests
-cargo clippy --workspace -- -D warnings
-cargo fmt --all --check
+scripts/check.sh            # format · lint · test · design-rule guards · Windows cross-check
+scripts/check.sh --fast     # same, without the Windows cross-check
 ```
+
+Enable the hook once per clone and the gate runs itself before every commit:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+The gate is deliberately local. A check that only runs in CI is a check you find
+out about twenty minutes late, on someone else's machine, after you have moved
+on. Continuous integration is reserved here for the one thing a laptop genuinely
+cannot do — running the Windows test suite on Windows.
+
+**Windows without Windows.** Windows code paths are type-checked locally for both
+`x86_64-pc-windows-msvc` and `aarch64-pc-windows-msvc`. `cargo check` compiles
+without linking, so no MSVC toolchain is required. Install the targets once:
+
+```bash
+rustup target add x86_64-pc-windows-msvc aarch64-pc-windows-msvc
+```
+
+This catches every Windows compile error before it is committed. It cannot catch
+Windows *runtime* behaviour — placeholder attributes, path semantics, filesystem
+quirks — and that is exactly where CI earns its place.
+
+### Design-rule guards
+
+Two rules are enforced mechanically by `scripts/guards.py`, because remembering
+them is not a strategy:
+
+- **DR-11** — direct filesystem calls (`fs::read`, `File::open`, `OpenOptions`,
+  and friends) are rejected outside `scrub-platform`. Reading a user path without
+  checking cloud state first can silently pull gigabytes down from a provider. If
+  the path is one the tool itself owns — an artifact, a config file — annotate the
+  line above it with `// DR-11-EXEMPT: <why this is not user data>`.
+- **Rule citations** — every `DR-nn` referenced in code or documentation must
+  exist in `docs/DESIGN-RULES.md`, so a renumbered rule cannot leave stale
+  pointers behind.
+
+Both guards are verified against a deliberate violation before being relied on. A
+guard that has never failed has never been shown to work.
 
 Tests run against a synthetic fixture tree that is generated, not committed — a
 directory containing known duplicates, simulated cloud placeholders, hard links,
