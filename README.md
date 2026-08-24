@@ -10,11 +10,11 @@ space, and lets you design a complete reorganization before a single file moves.
 It has no delete operation. It cannot overwrite a file. It never downloads a cloud
 file without asking. Every change it makes is reversible in one step.
 
-> **Status: early development.** Stages 1 to 3 of 7 are complete: `scrub scan`
-> records a machine, `scrub analyze` works out what is the same file as what, and
-> `scrub merge` compares two machines. Planning and the write path are next, and
-> nothing touches your files yet. See [`docs/PIPELINE.md`](docs/PIPELINE.md) for
-> the build order.
+> **Status: early development.** Phase 1 is complete — stages 1 to 4 of 7.
+> `scan` records a machine, `analyze` works out what is the same file as what,
+> `merge` compares two machines, and `plan` decides what should happen. **Nothing
+> writes to your files, at any stage, by design.** The write path is Phase 2. See
+> [`docs/PIPELINE.md`](docs/PIPELINE.md) for the build order.
 
 ---
 
@@ -85,7 +85,8 @@ cargo build --release -p scrub-cli
 
 ./target/release/scrub scan                       # your home directory
 ./target/release/scrub analyze scan.inventory     # what is the same as what
-./target/release/scrub inspect scan.analysis      # summarise an artifact
+./target/release/scrub plan scan.analysis         # what should happen about it
+./target/release/scrub inspect scan.plan          # summarise an artifact
 ./target/release/scrub export scan.inventory      # newline-delimited JSON
 ```
 
@@ -136,6 +137,27 @@ summary's word for anything:
 sqlite3 scan.inventory "SELECT path_text, logical_size FROM entry
                         WHERE cloud LIKE '%remote%' ORDER BY logical_size DESC LIMIT 20;"
 ```
+
+Planning changes nothing. It produces a document you can read, keep, hand to
+somebody else, and throw away:
+
+```
+Plan
+  Keeping the copy modified longest ago.
+  Nothing has happened. This is what would.
+
+  SET ASIDE  2 file(s), freeing 8.1 kB
+    Set aside means moved to quarantine, not deleted. Nothing leaves
+    quarantine until you empty it yourself.
+    Desktop/old/tax-kopya.pdf
+      same content as Documents/tax.pdf
+
+  No conflicts: every destination is free.
+```
+
+Conflicts — two files wanting the same destination, or a destination already
+occupied — are found here, while the plan is still a document. Not at operation
+four hundred with three hundred and ninety-nine already done.
 
 ## Platforms
 

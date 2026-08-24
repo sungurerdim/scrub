@@ -18,6 +18,7 @@ use scrub_core::artifact::{ArtifactHeader, ArtifactKind, Digest, MachineScope, S
 use scrub_core::cloud::{CloudRoot, CloudState, Detection, LinkVerdict, Provider, ProviderLink};
 use scrub_core::inventory::{Entry, EntryKind, FileId, ScanOutcome, Unread, UnreadReason};
 use scrub_core::paths::{PathEncoding, StoredPath};
+use scrub_core::plan::Operation;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -268,6 +269,52 @@ pub fn write_groups(transaction: &Transaction<'_>, groups: &[Group]) -> Result<(
         }
     }
     Ok(())
+}
+
+/// Writes a plan's operations.
+///
+/// The first columns are there to be read: what kind of thing this is, what it
+/// acts on, where it would end up, and what it would free. `detail` carries the
+/// operation in full, so nothing is lost to the convenience of the rest.
+pub fn write_operations(
+    transaction: &Transaction<'_>,
+    entries: &[Entry],
+    operations: &[Operation],
+) -> Result<(), StoreError> {
+    let mut statement =
+        transaction.prepare("INSERT INTO operation VALUES (?1, ?2, ?3, ?4, ?5, ?6)")?;
+    for (position, operation) in operations.iter().enumerate() {
+        let kind = match operation {
+            Operation::CreateDirectory { .. } => "create_directory",
+            Operation::Move { .. } => "move",
+            Operation::Quarantine { .. } => "quarantine",
+        };
+        statement.execute(params![
+            store(position as u64),
+            kind,
+            operation
+                .subject()
+                .map(|subject| subject.path.display().to_string()),
+            operation
+                .destination()
+                .map(|path| path.display().to_string()),
+            store(operation.frees(entries)),
+            to_json(operation),
+        ])?;
+    }
+    Ok(())
+}
+
+/// Reads a plan's operations back.
+pub fn read_operations(connection: &Connection) -> Result<Vec<Operation>, StoreError> {
+    let mut statement = connection.prepare("SELECT detail FROM operation ORDER BY position")?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    rows.iter()
+        .map(|detail| from_json::<Operation>("operation.detail", detail))
+        .collect()
 }
 
 /// Writes what reading established about each entry.
@@ -537,6 +584,15 @@ CREATE TABLE group_member (
 ) STRICT;
 
 CREATE INDEX group_member_by_group ON group_member (group_id);
+
+CREATE TABLE operation (
+    position       INTEGER NOT NULL PRIMARY KEY,
+    kind           TEXT    NOT NULL,
+    subject_path   TEXT,
+    destination    TEXT,
+    frees_bytes    INTEGER NOT NULL,
+    detail         TEXT    NOT NULL
+) STRICT;
 
 CREATE TABLE settled (
     entry_index INTEGER NOT NULL PRIMARY KEY,

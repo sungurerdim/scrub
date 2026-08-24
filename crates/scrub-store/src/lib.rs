@@ -15,7 +15,7 @@
 mod canonical;
 mod schema;
 
-pub use canonical::{analysis_digest, content_digest, scope_digest};
+pub use canonical::{analysis_digest, content_digest, plan_digest, scope_digest};
 
 use std::path::Path;
 
@@ -27,6 +27,7 @@ use scrub_core::artifact::{ArtifactHeader, Digest};
 use scrub_core::cloud::Detection;
 use scrub_core::inventory::ScanOutcome;
 use scrub_core::paths::PathEncoding;
+use scrub_core::plan::Operation;
 
 /// What a scan found, without regard to which artifact carries it.
 ///
@@ -210,6 +211,94 @@ impl Analysis {
             });
         }
         Ok(analysis)
+    }
+}
+
+/// A plan artifact: what a scan found, and what somebody intends to do about it.
+///
+/// Carries the whole body forward, so a plan can be reviewed — and its diff
+/// read — on a machine that holds neither the files nor the analysis (DR-17).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Plan {
+    /// Where this artifact sits in the chain.
+    pub header: ArtifactHeader,
+    /// What the scan found, carried forward intact.
+    pub body: Body,
+    /// What should happen, in the order it should happen.
+    pub operations: Vec<Operation>,
+}
+
+impl Plan {
+    /// The digest of this artifact's content, in canonical form.
+    #[must_use]
+    pub fn content_digest(&self) -> Digest {
+        canonical::plan_digest(&self.body, &self.operations)
+    }
+
+    /// Whether these paths can be acted on by this machine.
+    #[must_use]
+    pub fn is_native(&self) -> bool {
+        self.body.is_native()
+    }
+
+    /// Places two operations would collide, or that are already taken.
+    #[must_use]
+    pub fn conflicts(&self) -> Vec<scrub_core::plan::Conflict> {
+        scrub_core::plan::conflicts(&self.body.outcome.entries, &self.operations)
+    }
+
+    /// What carrying this out would achieve.
+    #[must_use]
+    pub fn effect(&self) -> scrub_core::plan::Effect {
+        scrub_core::plan::effect(&self.body.outcome.entries, &self.operations)
+    }
+
+    /// Writes the artifact.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::AlreadyThere`] if the path is occupied and
+    /// `replace` is false.
+    pub fn write(&self, path: &Path, replace: Replace) -> Result<(), StoreError> {
+        let mut connection = open_for_writing(path, replace)?;
+        schema::create(&connection)?;
+        schema::create_groups(&connection)?;
+        let transaction = connection.transaction()?;
+        schema::write_body(&transaction, &self.header, &self.body)?;
+        schema::write_operations(&transaction, &self.body.outcome.entries, &self.operations)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Reads a plan.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::ContentAltered`] if the recorded digest does not
+    /// match the content.
+    pub fn read(path: &Path) -> Result<Self, StoreError> {
+        // DR-11-EXEMPT: the tool's own artifact, never a path discovered by a
+        // scan.
+        let connection = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        let (header, body) = schema::read_body(&connection)?;
+        check_schema(&header)?;
+        let plan = Self {
+            header,
+            body,
+            operations: schema::read_operations(&connection)?,
+        };
+
+        let actual = plan.content_digest();
+        if actual != plan.header.content_digest {
+            return Err(StoreError::ContentAltered {
+                recorded: plan.header.content_digest,
+                found: actual,
+            });
+        }
+        Ok(plan)
     }
 }
 

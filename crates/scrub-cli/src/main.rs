@@ -62,6 +62,23 @@ enum Command {
         #[arg(long)]
         thorough: bool,
     },
+    /// Decide what should happen, without anything happening.
+    Plan {
+        /// The analysis to plan from.
+        analysis: PathBuf,
+        /// Which copy of a duplicated file to keep.
+        #[arg(long, value_enum, default_value_t = KeepRule::Oldest)]
+        keep: KeepRule,
+        /// Prefer copies under this path, whatever the rule says.
+        #[arg(long)]
+        prefer: Option<PathBuf>,
+        /// Where to write the plan.
+        #[arg(short, long, default_value = "scan.plan")]
+        out: PathBuf,
+        /// Write over an artifact already at that path.
+        #[arg(long)]
+        replace: bool,
+    },
     /// Compare two or more machines' analyses side by side.
     Merge {
         /// The analyses to combine. Each file's name becomes its label.
@@ -104,6 +121,13 @@ fn main() -> ExitCode {
             replace,
             thorough,
         } => analyze(&inventory, &out, quiet, replace, thorough),
+        Command::Plan {
+            analysis,
+            keep,
+            prefer,
+            out,
+            replace,
+        } => plan(&analysis, keep, prefer, &out, replace),
         Command::Merge {
             analyses,
             out,
@@ -277,6 +301,79 @@ fn analyze(
     Ok(())
 }
 
+/// Which copy of a duplicated file to keep.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum KeepRule {
+    /// The one modified longest ago, which is usually the original.
+    Oldest,
+    /// The one modified most recently.
+    Newest,
+    /// The one with the fewest directories above it.
+    Shallowest,
+}
+
+fn plan(
+    analysis_path: &std::path::Path,
+    keep: KeepRule,
+    prefer: Option<PathBuf>,
+    out: &std::path::Path,
+    replace: bool,
+) -> Result<(), String> {
+    check_output_is_free(out, replace)?;
+
+    let analysis = scrub_store::Analysis::read(analysis_path)
+        .map_err(|error| format!("could not read {}: {error}", analysis_path.display()))?;
+
+    // A comparison of several machines describes no single machine, so no single
+    // machine can carry out a plan made from it (DR-18).
+    if matches!(
+        analysis.header.machine,
+        scrub_core::artifact::MachineScope::Merged { .. }
+    ) {
+        return Err(
+            "this is a comparison of several machines, and a plan has to be about one. \
+             Plan from each machine's own analysis instead."
+                .to_owned(),
+        );
+    }
+
+    let rule = match prefer {
+        Some(path) => scrub_core::plan::Keep::Under(path),
+        None => match keep {
+            KeepRule::Oldest => scrub_core::plan::Keep::Oldest,
+            KeepRule::Newest => scrub_core::plan::Keep::Newest,
+            KeepRule::Shallowest => scrub_core::plan::Keep::Shallowest,
+        },
+    };
+
+    let operations = scrub_core::plan::ordered(scrub_core::plan::resolve_duplicates(
+        &analysis.body.outcome.entries,
+        &analysis.groups,
+        &rule,
+    ));
+
+    let parent = analysis.header.content_digest;
+    let mut drafted = scrub_store::Plan {
+        header: header_for(
+            Stage::Plan,
+            vec![parent],
+            analysis.header.scope_digest,
+            scrub_core::artifact::Digest::of(b"placeholder"),
+        )?,
+        body: analysis.body,
+        operations,
+    };
+    drafted.header.machine = analysis.header.machine;
+    drafted.header.content_digest = drafted.content_digest();
+
+    drafted
+        .write(out, replacement(replace))
+        .map_err(|error| error.to_string())?;
+
+    report::describe_plan(&drafted, &rule, Some(out));
+    Ok(())
+}
+
 fn merge(analyses: &[PathBuf], out: &std::path::Path, replace: bool) -> Result<(), String> {
     check_output_is_free(out, replace)?;
     if analyses.len() < 2 {
@@ -370,8 +467,16 @@ fn label_for(path: &std::path::Path) -> String {
 }
 
 fn inspect(artifact: &std::path::Path) -> Result<(), String> {
-    // An analysis is an inventory with more in it, so trying that first tells us
-    // which we were handed without asking the caller to say.
+    // Each artifact is the one before it with more in it, so trying the richest
+    // first tells us which we were handed without asking the caller to say.
+    if let Ok(drafted) = scrub_store::Plan::read(artifact)
+        && drafted.header.stage == Stage::Plan
+    {
+        report::describe_header(&drafted.header, drafted.is_native());
+        report::describe_plan(&drafted, &scrub_core::plan::Keep::Oldest, None);
+        return Ok(());
+    }
+
     if let Ok(analysis) = scrub_store::Analysis::read(artifact)
         && analysis.header.stage == Stage::Analyze
     {

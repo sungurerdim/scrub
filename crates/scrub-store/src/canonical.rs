@@ -18,6 +18,22 @@ use scrub_core::paths::StoredPath;
 
 use crate::Body;
 
+/// The digest of a plan.
+///
+/// Covers the operations in the order they were recorded, because order is part
+/// of what a plan says: creating a directory after moving into it is a different
+/// plan from doing it before.
+#[must_use]
+pub fn plan_digest(body: &Body, operations: &[scrub_core::plan::Operation]) -> Digest {
+    let mut hasher = Hasher::new();
+    field(&mut hasher, content_digest(body, &[]).to_hex().as_bytes());
+    section(&mut hasher, b"operations", operations.len());
+    for operation in operations {
+        json(&mut hasher, operation);
+    }
+    Digest::of(hasher.finalize().as_bytes())
+}
+
 /// The digest of an artifact's content.
 ///
 /// Covers the scan body and, for an analysis, the groups derived from it. An

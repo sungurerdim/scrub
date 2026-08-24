@@ -438,3 +438,98 @@ fn an_artifact_from_an_older_format_says_so_rather_than_crying_tamper() {
         "an older format is reported as an older format, got {outcome:?}"
     );
 }
+
+/// A plan over the same body.
+fn drafted() -> scrub_store::Plan {
+    use scrub_core::plan::{Because, Operation, Subject};
+
+    let inventory = sample();
+    let body = inventory.body;
+    let subject = Subject::of(
+        0,
+        &body.outcome.entries[0],
+        Some(Digest::of(b"shared content")),
+    );
+
+    let operations = vec![
+        Operation::CreateDirectory {
+            path: PathBuf::from("/home/archive"),
+        },
+        Operation::Move {
+            subject: subject.clone(),
+            destination: PathBuf::from("/home/archive/özet çalışma.txt"),
+        },
+        Operation::Quarantine {
+            subject,
+            because: Because::RedundantCopy {
+                kept: PathBuf::from("/home/papers/kept.txt"),
+                content: Digest::of(b"shared content"),
+            },
+        },
+    ];
+
+    let mut header = header(Digest::of(b"placeholder"));
+    header.stage = Stage::Plan;
+    header.kind = Stage::Plan.output_kind();
+    header.parents = vec![Digest::of(b"the analysis this came from")];
+
+    let mut plan = scrub_store::Plan {
+        header,
+        body,
+        operations,
+    };
+    plan.header.content_digest = plan.content_digest();
+    plan
+}
+
+#[test]
+fn a_plan_survives_being_written_and_read() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let file = directory.path().join("scan.plan");
+
+    let original = drafted();
+    original
+        .write(&file, scrub_store::Replace::Never)
+        .expect("the plan must write");
+    let recovered = scrub_store::Plan::read(&file).expect("the plan must read back");
+
+    assert_eq!(original, recovered);
+}
+
+#[test]
+fn the_order_of_a_plan_is_part_of_what_it_says() {
+    // Creating a directory after moving into it is a different plan from doing
+    // it before, and one of the two does not work. Order has to survive storage
+    // and has to be covered by the digest.
+    let mut reordered = drafted();
+    reordered.operations.reverse();
+
+    assert_ne!(
+        drafted().content_digest(),
+        reordered.content_digest(),
+        "reordering the operations changes the plan"
+    );
+}
+
+#[test]
+fn a_plan_edited_after_writing_is_refused() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let file = directory.path().join("scan.plan");
+    drafted()
+        .write(&file, scrub_store::Replace::Never)
+        .expect("write");
+
+    let connection = rusqlite::Connection::open(&file).expect("open for editing");
+    connection
+        .execute("DELETE FROM operation WHERE kind = 'quarantine'", [])
+        .expect("quietly drop an operation");
+    drop(connection);
+
+    assert!(
+        matches!(
+            scrub_store::Plan::read(&file),
+            Err(scrub_store::StoreError::ContentAltered { .. })
+        ),
+        "an operation removed behind the tool's back must be caught"
+    );
+}

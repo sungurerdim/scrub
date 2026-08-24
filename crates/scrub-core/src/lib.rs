@@ -16,6 +16,7 @@ pub mod cloud;
 pub mod inventory;
 pub mod merge;
 pub mod paths;
+pub mod plan;
 
 pub use artifact::{
     ArtifactHeader, ArtifactKind, ChainError, Digest, MachineId, MachineScope, ParentRef,

@@ -14,6 +14,7 @@ use scrub_core::analysis::{Certainty, Settled};
 use scrub_core::artifact::ArtifactHeader;
 use scrub_core::cloud::{CloudMap, LinkVerdict, Residency};
 use scrub_core::inventory::{Entry, EntryKind, ScanOutcome, UnreadReason};
+use scrub_core::plan::Keep;
 use scrub_store::{Analysis, Body};
 
 /// Prints what the machine is synchronising, before the scan starts.
@@ -542,6 +543,130 @@ fn count_exclusive(
         .filter_map(|(_, state)| state.content())
         .filter(|digest| !elsewhere.contains(digest))
         .count()
+}
+
+/// Prints a plan as the difference between how things are and how they would be.
+///
+/// The screen a decision is made on. Everything it says is in the conditional,
+/// because nothing has happened: a plan is a document until somebody applies it,
+/// and reading one changes nothing at all (DR-9).
+pub fn describe_plan(plan: &scrub_store::Plan, rule: &Keep, written_to: Option<&Path>) {
+    let effect = plan.effect();
+    let conflicts = plan.conflicts();
+
+    println!("\nPlan");
+    println!("  {}", describe_rule(rule));
+    println!("  Nothing has happened. This is what would.");
+
+    if plan.operations.is_empty() {
+        println!("\n  No operations. There is nothing to do.");
+        return;
+    }
+
+    if effect.directories > 0 {
+        println!("\n  CREATE  {} director(ies)", effect.directories);
+    }
+    if effect.moved > 0 {
+        println!("\n  MOVE    {} file(s)", effect.moved);
+        for operation in plan.operations.iter().take(200) {
+            if let scrub_core::plan::Operation::Move {
+                subject,
+                destination,
+            } = operation
+            {
+                println!("    {}", subject.path.display());
+                println!("      to {}", destination.display());
+            }
+        }
+    }
+
+    if effect.quarantined > 0 {
+        println!(
+            "\n  SET ASIDE  {} file(s), freeing {}",
+            effect.quarantined,
+            human_bytes(effect.frees)
+        );
+        println!("    Set aside means moved to quarantine, not deleted. Nothing leaves");
+        println!("    quarantine until you empty it yourself.");
+        show_quarantines(plan);
+    }
+
+    // Reported here, while the plan is still a document. The same collision
+    // discovered halfway through execution is a half-finished reorganization
+    // (DR-6).
+    println!();
+    if conflicts.is_empty() {
+        println!("  No conflicts: every destination is free.");
+    } else {
+        println!(
+            "  {} CONFLICT(S) — nothing will run until these are settled:",
+            conflicts.len()
+        );
+        for conflict in conflicts.iter().take(20) {
+            println!("    {}", conflict.destination.display());
+            if let Some(entry) = conflict.occupied_by {
+                println!(
+                    "      already holds {}",
+                    plan.body.outcome.entries[entry].path.display()
+                );
+            }
+            if conflict.claimants.len() > 1 {
+                println!("      wanted by {} operations", conflict.claimants.len());
+            }
+        }
+        if conflicts.len() > 20 {
+            println!("    … and {} more", conflicts.len() - 20);
+        }
+    }
+
+    if let Some(path) = written_to {
+        println!("\nWritten to {}", path.display());
+        println!("  content digest {}", plan.header.content_digest);
+        println!("  Nothing on disk has been touched.");
+    }
+}
+
+/// The first few files a plan would set aside, and why.
+///
+/// A sample rather than the list: a plan can hold hundreds of thousands of
+/// operations, and a wall of them is not a thing anyone reviews. The artifact
+/// holds every one, queryable.
+fn show_quarantines(plan: &scrub_store::Plan) {
+    let mut shown = 0;
+    for operation in &plan.operations {
+        let scrub_core::plan::Operation::Quarantine { subject, because } = operation else {
+            continue;
+        };
+        if shown >= 5 {
+            break;
+        }
+        shown += 1;
+        println!("    {}", subject.path.display());
+        if let scrub_core::plan::Because::RedundantCopy { kept, .. } = because {
+            println!("      same content as {}", kept.display());
+        }
+    }
+
+    let total = plan
+        .operations
+        .iter()
+        .filter(|operation| matches!(operation, scrub_core::plan::Operation::Quarantine { .. }))
+        .count();
+    if total > shown {
+        println!(
+            "    … and {} more, all of them in the artifact",
+            total - shown
+        );
+    }
+}
+
+fn describe_rule(rule: &Keep) -> String {
+    match rule {
+        Keep::Oldest => "Keeping the copy modified longest ago.".to_owned(),
+        Keep::Newest => "Keeping the copy modified most recently.".to_owned(),
+        Keep::Shallowest => "Keeping the copy with the fewest directories above it.".to_owned(),
+        Keep::Under(path) => format!("Keeping the copy under {}.", path.display()),
+    }
 }
 
 #[cfg(test)]

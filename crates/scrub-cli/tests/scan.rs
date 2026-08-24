@@ -494,3 +494,211 @@ fn merging_a_single_analysis_is_refused() {
         "one analysis is not a comparison of anything"
     );
 }
+
+/// A tree where the original and its copies are unambiguous.
+fn original_and_copies() -> tempfile::TempDir {
+    let tree = tempfile::tempdir().expect("a temporary directory");
+    fs::create_dir_all(tree.path().join("Documents")).expect("create Documents");
+    fs::create_dir_all(tree.path().join("Desktop/old")).expect("create Desktop/old");
+
+    fs::write(tree.path().join("Documents/tax.pdf"), b"the 2026 return").expect("write");
+    std::thread::sleep(std::time::Duration::from_millis(1_100));
+    fs::write(
+        tree.path().join("Desktop/old/tax-copy.pdf"),
+        b"the 2026 return",
+    )
+    .expect("write");
+    fs::write(tree.path().join("Documents/notes.txt"), b"unrelated").expect("write");
+
+    tree
+}
+
+fn plan_of(tree: &std::path::Path, workspace: &std::path::Path, keep: &str) -> String {
+    let inventory = workspace.join("scan.inventory");
+    let analysis = workspace.join("scan.analysis");
+    let drafted = workspace.join(format!("{keep}.plan"));
+
+    assert!(
+        scrub()
+            .args(["scan", "--quiet", "--replace", "--out"])
+            .arg(&inventory)
+            .arg(tree)
+            .status()
+            .expect("scan")
+            .success()
+    );
+    assert!(
+        scrub()
+            .args(["analyze", "--quiet", "--replace", "--out"])
+            .arg(&analysis)
+            .arg(&inventory)
+            .status()
+            .expect("analyze")
+            .success()
+    );
+
+    let output = scrub()
+        .args(["plan", "--replace", "--keep", keep, "--out"])
+        .arg(&drafted)
+        .arg(&analysis)
+        .output()
+        .expect("plan must run");
+    assert!(
+        output.status.success(),
+        "plan failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// A fingerprint of every file in a tree, to prove nothing moved.
+fn tree_state(root: &std::path::Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut found = Vec::new();
+    let mut queue = vec![root.to_path_buf()];
+    while let Some(directory) = queue.pop() {
+        for entry in fs::read_dir(&directory).expect("read").flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                queue.push(path);
+            } else {
+                let content = fs::read(&path).expect("read file");
+                found.push((path, content));
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+#[test]
+fn planning_changes_nothing_on_disk() {
+    // The promise the stage is built on (DR-9). Everything a plan describes is
+    // in the conditional until somebody applies it, and there is no apply yet.
+    let tree = original_and_copies();
+    let elsewhere = workspace();
+
+    let before = tree_state(tree.path());
+    let text = plan_of(tree.path(), elsewhere.path(), "oldest");
+    let after = tree_state(tree.path());
+
+    assert_eq!(before, after, "the tree must be untouched, byte for byte");
+    assert!(text.contains("Nothing on disk has been touched"));
+}
+
+#[test]
+fn a_plan_keeps_the_copy_the_rule_asks_for() {
+    let tree = original_and_copies();
+    let elsewhere = workspace();
+
+    let oldest = plan_of(tree.path(), elsewhere.path(), "oldest");
+    assert!(
+        oldest.contains("tax-copy.pdf") && oldest.contains("same content as"),
+        "the later copy is set aside and the original kept: {oldest}"
+    );
+
+    let newest = plan_of(tree.path(), elsewhere.path(), "newest");
+    assert!(
+        newest.contains("Documents/tax.pdf"),
+        "asking for the newest keeps the copy and sets the original aside: {newest}"
+    );
+}
+
+#[test]
+fn a_plan_contains_no_operation_that_destroys_anything() {
+    // DR-5, checked against the artifact rather than against the prose. The
+    // strongest thing a plan can say about a file is that it should go to
+    // quarantine; if a destroying operation ever becomes expressible, this
+    // fails before anyone can generate one.
+    let tree = original_and_copies();
+    let elsewhere = workspace();
+    let text = plan_of(tree.path(), elsewhere.path(), "oldest");
+
+    let exported = scrub()
+        .arg("export")
+        .arg(elsewhere.path().join("scan.inventory"))
+        .output()
+        .expect("export must run");
+    assert!(exported.status.success());
+
+    let drafted = elsewhere.path().join("oldest.plan");
+    let kinds = std::process::Command::new("sqlite3")
+        .arg(&drafted)
+        .arg("SELECT DISTINCT kind FROM operation;")
+        .output();
+
+    if let Ok(kinds) = kinds
+        && kinds.status.success()
+    {
+        let listed = String::from_utf8_lossy(&kinds.stdout);
+        for kind in listed.lines() {
+            assert!(
+                matches!(kind, "create_directory" | "move" | "quarantine"),
+                "a plan may only create, move, or set aside — found {kind:?}"
+            );
+        }
+        assert!(
+            listed.contains("quarantine"),
+            "this plan does set files aside"
+        );
+    }
+
+    // And the report says so, because somebody skimming it has to come away
+    // knowing their files are recoverable.
+    assert!(
+        text.contains("not deleted"),
+        "the report says so plainly: {text}"
+    );
+}
+
+#[test]
+fn a_plan_reads_back_with_its_findings_intact() {
+    let tree = original_and_copies();
+    let elsewhere = workspace();
+    plan_of(tree.path(), elsewhere.path(), "oldest");
+
+    let inspected = scrub()
+        .arg("inspect")
+        .arg(elsewhere.path().join("oldest.plan"))
+        .output()
+        .expect("inspect must run");
+    assert!(inspected.status.success());
+
+    let text = String::from_utf8_lossy(&inspected.stdout);
+    assert!(text.contains("Plan"), "the stage is reported: {text}");
+    assert!(text.contains("SET ASIDE"), "the operations survive: {text}");
+}
+
+#[test]
+fn a_plan_cannot_be_made_from_a_comparison() {
+    // A comparison is about several machines, and a plan has to be about one
+    // (DR-18).
+    let (first, second) = two_machines();
+    let elsewhere = workspace();
+    let one = analysis_of(first.path(), elsewhere.path(), "mac");
+    let two = analysis_of(second.path(), elsewhere.path(), "windows");
+    let combined = elsewhere.path().join("combined.analysis");
+
+    assert!(
+        scrub()
+            .arg("merge")
+            .arg(&one)
+            .arg(&two)
+            .args(["--out"])
+            .arg(&combined)
+            .status()
+            .expect("merge")
+            .success()
+    );
+
+    let output = scrub()
+        .arg("plan")
+        .arg(&combined)
+        .args(["--out"])
+        .arg(elsewhere.path().join("impossible.plan"))
+        .output()
+        .expect("plan must run");
+    assert!(
+        !output.status.success(),
+        "planning from a comparison is refused"
+    );
+}
