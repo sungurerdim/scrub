@@ -1,0 +1,51 @@
+@import "tailwindcss";
+
+/* The surface is calm by default and loud only where it must be (DR-21).
+   One accent for what you can do, one warning colour for what you should look
+   at, and nothing else competing for attention. */
+@theme {
+  --color-ground: oklch(0.19 0.014 250);
+  --color-raised: oklch(0.235 0.016 250);
+  --color-edge: oklch(0.31 0.018 250);
+  --color-ink: oklch(0.95 0.006 250);
+  --color-faded: oklch(0.72 0.014 250);
+  --color-dim: oklch(0.58 0.014 250);
+  --color-accent: oklch(0.78 0.13 168);
+  --color-accent-ink: oklch(0.22 0.05 168);
+  --color-warn: oklch(0.82 0.14 78);
+  --color-alarm: oklch(0.68 0.17 25);
+
+  --font-sans: ui-sans-serif, -apple-system, "SF Pro Text", "Segoe UI", system-ui,
+    sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, monospace;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    background: var(--color-ground);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    /* The window is a document, not a web page: nothing about it should invite
+       a text selection or a rubber-band scroll. */
+    -webkit-user-select: none;
+    user-select: none;
+    overscroll-behavior: none;
+  }
+
+  /* Paths are the exception: somebody will want to copy one. */
+  .selectable {
+    -webkit-user-select: text;
+    user-select: text;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
+  }
+}

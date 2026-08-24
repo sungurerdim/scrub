@@ -6,14 +6,14 @@
 
 #![forbid(unsafe_code)]
 
-mod machine;
 mod report;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use scrub_core::artifact::{ArtifactHeader, MachineScope, SCHEMA_VERSION, Stage};
+use scrub_core::artifact::Stage;
+use scrub_run::machine;
 use scrub_store::Inventory;
 
 /// See every file you own, across every cloud, and reorganize it without ever
@@ -153,7 +153,7 @@ fn main() -> ExitCode {
             out,
             quiet,
             replace,
-        } => scan(paths, &out, quiet, replace),
+        } => scan(&paths, &out, quiet, replace),
         Command::Analyze {
             inventory,
             out,
@@ -203,328 +203,82 @@ fn main() -> ExitCode {
 }
 
 fn scan(
-    paths: Vec<PathBuf>,
-    out: &std::path::Path,
+    paths: &[PathBuf],
+    out: &Path,
     quiet: bool,
     replace: bool,
-) -> Result<(), String> {
-    check_output_is_free(out, replace)?;
+) -> Result<(), scrub_run::RunError> {
+    scrub_run::check_output_is_free(out, replace)?;
 
-    // Before anything else: ask the platform to make an accidental download
-    // impossible. If it refuses, the scan does not start — proceeding would risk
-    // pulling a user's archive down over a metered connection (DR-11).
-    let mode = scrub_platform::enter_read_only_scan_mode().map_err(|error| error.to_string())?;
-
-    let home = home_directory()?;
-    let map = scrub_platform::detect_cloud_map(&home).map_err(|error| error.to_string())?;
-
-    let roots = if paths.is_empty() { vec![home] } else { paths };
-
-    report::describe_providers(&map);
-
-    let mut outcome = scrub_core::inventory::ScanOutcome::default();
-    for root in &roots {
-        let mut progress = report::Progress::new(quiet, root);
-        let found = scrub_platform::walk::walk_reporting(root, &map, &mode, &mut |state| {
-            progress.update(state);
-        });
-        progress.finish(&found);
-        outcome.entries.extend(found.entries);
-        outcome.unread.extend(found.unread);
+    // Detected once here purely so the providers can be named before a scan of
+    // two million files begins; the scan detects them again for itself.
+    let home = scrub_run::home_directory()?;
+    if let Ok(map) = scrub_platform::detect_cloud_map(&home) {
+        report::describe_providers(&map);
     }
 
-    let body = scrub_store::Body {
-        path_encoding: scrub_core::paths::LOCAL,
-        detection: scrub_core::cloud::Detection {
-            roots: map.roots().to_vec(),
-            links: map.links().to_vec(),
-        },
-        outcome,
-    };
-
-    let inventory = Inventory {
-        header: header_for(
-            Stage::Scan,
-            Vec::new(),
-            scrub_store::scope_digest(&roots),
-            scrub_store::content_digest(&body, &[]),
-        )?,
-        body,
-    };
-
-    inventory
-        .write(out, replacement(replace))
-        .map_err(|error| error.to_string())?;
+    let mut watcher = report::Terminal::new(quiet);
+    let inventory = scrub_run::scan(paths, machine::identity()?, &mut watcher)?;
+    inventory.write(out, scrub_run::replacement(replace))?;
 
     report::describe_body(&inventory.body, Some(out));
     Ok(())
 }
 
-/// Refuses an occupied output before any work is done.
-///
-/// The same refusal happens at the moment of writing, which is where the
-/// invariant belongs. This one exists so that a scan of two million files does
-/// not run to completion before announcing that its output name was taken.
-fn check_output_is_free(out: &std::path::Path, replace: bool) -> Result<(), String> {
-    if replace || !out.exists() {
-        return Ok(());
-    }
-    Err(format!(
-        "{} already exists, and nothing is overwritten without being asked. \
-         Choose another name, or pass --replace to write over it.",
-        out.display()
-    ))
-}
-
-fn replacement(replace: bool) -> scrub_store::Replace {
-    if replace {
-        scrub_store::Replace::Yes
-    } else {
-        scrub_store::Replace::Never
-    }
-}
-
-/// Builds the header every artifact this run produces.
-fn header_for(
-    stage: Stage,
-    parents: Vec<scrub_core::artifact::Digest>,
-    scope_digest: scrub_core::artifact::Digest,
-    content_digest: scrub_core::artifact::Digest,
-) -> Result<ArtifactHeader, String> {
-    Ok(ArtifactHeader {
-        schema_version: SCHEMA_VERSION,
-        tool_version: env!("CARGO_PKG_VERSION").to_owned(),
-        stage,
-        kind: stage.output_kind(),
-        parents,
-        machine: MachineScope::Single {
-            machine: machine::identity()?,
-        },
-        created_at: jiff::Timestamp::now(),
-        scope_digest,
-        content_digest,
-    })
-}
-
 fn analyze(
-    inventory_path: &std::path::Path,
-    out: &std::path::Path,
+    inventory: &Path,
+    out: &Path,
     quiet: bool,
     replace: bool,
     thorough: bool,
-) -> Result<(), String> {
-    check_output_is_free(out, replace)?;
+) -> Result<(), scrub_run::RunError> {
+    scrub_run::check_output_is_free(out, replace)?;
 
-    // Analysis reads file content, so the same guard the scan starts under
-    // applies here with more force (DR-11).
-    let mode = scrub_platform::enter_read_only_scan_mode().map_err(|error| error.to_string())?;
-
-    let inventory = Inventory::read(inventory_path)
-        .map_err(|error| format!("could not read {}: {error}", inventory_path.display()))?;
-    scrub_core::artifact::verify_executable_here(&inventory.header, machine::identity()?)
-        .map_err(|error| error.to_string())?;
-    if !inventory.is_native() {
-        return Err(
-            "this inventory was recorded by a machine that spells paths differently,              so its files cannot be read here"
-                .to_owned(),
-        );
-    }
-
-    let entries = &inventory.body.outcome.entries;
-    let parent = inventory.header.content_digest;
-
-    let settled = report::run_passes(entries, &mode, quiet, thorough);
-    let groups = scrub_core::analysis::group_duplicates(entries, &settled);
-    let settled: std::collections::BTreeMap<_, _> = settled.into_iter().collect();
-
-    let analysis = scrub_store::Analysis {
-        header: header_for(
-            Stage::Analyze,
-            vec![parent],
-            inventory.header.scope_digest,
-            scrub_store::analysis_digest(&inventory.body, &groups, &settled),
-        )?,
-        body: inventory.body,
-        groups,
-        settled,
+    let depth = if thorough {
+        scrub_run::Depth::Thorough
+    } else {
+        scrub_run::Depth::Duplicates
     };
-
-    analysis
-        .write(out, replacement(replace))
-        .map_err(|error| error.to_string())?;
+    let mut watcher = report::Terminal::new(quiet);
+    let analysis = scrub_run::analyze(inventory, machine::identity()?, depth, &mut watcher)?;
+    analysis.write(out, scrub_run::replacement(replace))?;
 
     report::describe_groups(&analysis, Some(out));
     Ok(())
 }
 
-fn apply(
-    preflight_path: &std::path::Path,
-    out: &std::path::Path,
+fn plan(
+    analysis: &Path,
+    keep: KeepRule,
+    prefer: Option<PathBuf>,
+    out: &Path,
     replace: bool,
-) -> Result<(), String> {
-    check_output_is_free(out, replace)?;
+) -> Result<(), scrub_run::RunError> {
+    scrub_run::check_output_is_free(out, replace)?;
 
-    // Reading content is part of the last check before each move, so the same
-    // guard every other stage starts under applies here too (DR-11).
-    let mode = scrub_platform::enter_read_only_scan_mode().map_err(|error| error.to_string())?;
+    let rule = match prefer {
+        Some(path) => scrub_core::plan::Keep::Under(path),
+        None => match keep {
+            KeepRule::Oldest => scrub_core::plan::Keep::Oldest,
+            KeepRule::Newest => scrub_core::plan::Keep::Newest,
+            KeepRule::Shallowest => scrub_core::plan::Keep::Shallowest,
+        },
+    };
 
-    let checked = scrub_store::Preflight::read(preflight_path)
-        .map_err(|error| format!("could not read {}: {error}", preflight_path.display()))?;
-    scrub_core::artifact::verify_executable_here(&checked.header, machine::identity()?)
-        .map_err(|error| error.to_string())?;
+    let drafted = scrub_run::plan(analysis, &rule, machine::identity()?)?;
+    drafted.write(out, scrub_run::replacement(replace))?;
 
-    let running = checked.passing();
-    if running.is_empty() {
-        return Err(
-            "nothing passed preflight, so there is nothing to carry out. \
-             Re-plan to settle what was held back."
-                .to_owned(),
-        );
-    }
-
-    let quarantine =
-        scrub_platform::execute::Quarantine::at(scrub_platform::verify::quarantine_beside(out))
-            .map_err(|error| format!("could not prepare the quarantine directory: {error}"))?;
-
-    let home = home_directory()?;
-    let map = scrub_platform::detect_cloud_map(&home).map_err(|error| error.to_string())?;
-
-    let header = header_for(
-        Stage::Apply,
-        vec![checked.header.content_digest],
-        checked.header.scope_digest,
-        scrub_core::artifact::Digest::of(b"placeholder"),
-    )?;
-
-    // Opened before anything is done, so a run that is killed halfway through
-    // leaves a record of where it got to (DR-7).
-    let connection = scrub_store::Journal::begin(
-        out,
-        &header,
-        &checked.body,
-        &checked.operations,
-        replacement(replace),
-    )
-    .map_err(|error| error.to_string())?;
-
-    println!("Carrying out {} operation(s).", running.len());
-    println!("  Quarantine: {}", quarantine.root().display());
-
-    let mut steps = Vec::with_capacity(running.len());
-    for (sequence, index) in running.iter().enumerate() {
-        let Some(operation) = checked.operations.get(*index) else {
-            continue;
-        };
-
-        // Written down before it is attempted. A crash between these two lines
-        // leaves a step marked as intended, which a later run can settle by
-        // looking rather than by guessing.
-        let intended = scrub_core::journal::Step {
-            operation: *index,
-            progress: scrub_core::journal::Progress::Intended,
-            from: operation
-                .subject()
-                .map_or_else(PathBuf::new, |subject| subject.path.clone()),
-            to: None,
-            content: operation.subject().and_then(|subject| subject.content),
-            at: jiff::Timestamp::now(),
-        };
-        scrub_store::Journal::record(&connection, sequence, &intended)
-            .map_err(|error| error.to_string())?;
-
-        let step = scrub_platform::execute::perform(*index, operation, &quarantine, &map, &mode);
-        scrub_store::Journal::record(&connection, sequence, &step)
-            .map_err(|error| error.to_string())?;
-        steps.push(step);
-    }
-
-    let digest = scrub_store::journal_digest(&checked.body, &checked.operations, &steps);
-    scrub_store::Journal::finish(&connection, digest).map_err(|error| error.to_string())?;
-    drop(connection);
-
-    let journal = scrub_store::Journal::read(out).map_err(|error| error.to_string())?;
-    report::describe_run(&journal, out, Some(quarantine.root()));
-    Ok(())
-}
-
-fn undo(
-    journal_path: &std::path::Path,
-    out: &std::path::Path,
-    replace: bool,
-) -> Result<(), String> {
-    check_output_is_free(out, replace)?;
-    let mode = scrub_platform::enter_read_only_scan_mode().map_err(|error| error.to_string())?;
-
-    let done = scrub_store::Journal::read(journal_path)
-        .map_err(|error| format!("could not read {}: {error}", journal_path.display()))?;
-    scrub_core::artifact::verify_executable_here(&done.header, machine::identity()?)
-        .map_err(|error| error.to_string())?;
-
-    if !done.finished {
-        println!("This run did not reach its end. Reversing what it did get to.");
-    }
-
-    let order = scrub_core::journal::reversal_order(&done.steps);
-    if order.is_empty() {
-        return Err("this run changed nothing, so there is nothing to put back".to_owned());
-    }
-
-    let home = home_directory()?;
-    let map = scrub_platform::detect_cloud_map(&home).map_err(|error| error.to_string())?;
-
-    let header = header_for(
-        Stage::Undo,
-        vec![done.header.content_digest],
-        done.header.scope_digest,
-        scrub_core::artifact::Digest::of(b"placeholder"),
-    )?;
-    let connection = scrub_store::Journal::begin(
-        out,
-        &header,
-        &done.body,
-        &done.operations,
-        replacement(replace),
-    )
-    .map_err(|error| error.to_string())?;
-
-    println!("Putting {} file(s) back.", order.len());
-
-    let mut steps = Vec::with_capacity(order.len());
-    for (sequence, index) in order.iter().enumerate() {
-        let step = scrub_platform::execute::reverse(*index, &done.steps[*index], &map, &mode);
-        scrub_store::Journal::record(&connection, sequence, &step)
-            .map_err(|error| error.to_string())?;
-        steps.push(step);
-    }
-
-    let digest = scrub_store::journal_digest(&done.body, &done.operations, &steps);
-    scrub_store::Journal::finish(&connection, digest).map_err(|error| error.to_string())?;
-    drop(connection);
-
-    let reversed = scrub_store::Journal::read(out).map_err(|error| error.to_string())?;
-    report::describe_run(&reversed, out, None);
+    report::describe_plan(&drafted, &rule, Some(out));
     Ok(())
 }
 
 fn preflight(
-    plan_path: &std::path::Path,
-    out: &std::path::Path,
+    plan: &Path,
+    out: &Path,
     fast: bool,
     replace: bool,
-) -> Result<(), String> {
-    check_output_is_free(out, replace)?;
-
-    // Checking reads content, so the same guard every reading stage starts
-    // under applies here too (DR-11).
-    let mode = scrub_platform::enter_read_only_scan_mode().map_err(|error| error.to_string())?;
-
-    let drafted = scrub_store::Plan::read(plan_path)
-        .map_err(|error| format!("could not read {}: {error}", plan_path.display()))?;
-
-    // A plan made for another machine names paths that mean something else here
-    // (DR-18).
-    scrub_core::artifact::verify_executable_here(&drafted.header, machine::identity()?)
-        .map_err(|error| error.to_string())?;
+) -> Result<(), scrub_run::RunError> {
+    scrub_run::check_output_is_free(out, replace)?;
 
     let rigour = if fast {
         scrub_core::preflight::Rigour::Metadata
@@ -532,36 +286,43 @@ fn preflight(
         scrub_core::preflight::Rigour::Content
     };
 
-    let home = home_directory()?;
-    let map = scrub_platform::detect_cloud_map(&home).map_err(|error| error.to_string())?;
-
-    let verdicts = scrub_platform::verify::verify(
-        &drafted.operations,
-        &drafted.body.outcome.entries,
-        &map,
-        rigour,
-        &mode,
-    );
-
-    let parent = drafted.header.content_digest;
-    let mut checked = scrub_store::Preflight {
-        header: header_for(
-            Stage::Preflight,
-            vec![parent],
-            drafted.header.scope_digest,
-            scrub_core::artifact::Digest::of(b"placeholder"),
-        )?,
-        body: drafted.body,
-        operations: drafted.operations,
-        verdicts,
-    };
-    checked.header.content_digest = checked.content_digest();
-
-    checked
-        .write(out, replacement(replace))
-        .map_err(|error| error.to_string())?;
+    let checked = scrub_run::preflight(plan, rigour, machine::identity()?)?;
+    checked.write(out, scrub_run::replacement(replace))?;
 
     report::describe_preflight(&checked, Some(out));
+    Ok(())
+}
+
+fn apply(preflight: &Path, out: &Path, replace: bool) -> Result<(), scrub_run::RunError> {
+    scrub_run::check_output_is_free(out, replace)?;
+
+    let mut watcher = report::Terminal::new(false);
+    let run = scrub_run::apply(preflight, out, replace, machine::identity()?, &mut watcher)?;
+
+    report::describe_run(&run.journal, out, run.quarantine.as_deref());
+    Ok(())
+}
+
+fn undo(journal: &Path, out: &Path, replace: bool) -> Result<(), scrub_run::RunError> {
+    scrub_run::check_output_is_free(out, replace)?;
+
+    let mut watcher = report::Terminal::new(false);
+    let run = scrub_run::undo(journal, out, replace, machine::identity()?, &mut watcher)?;
+    if run.source_was_unfinished {
+        println!("This run did not reach its end. Reversing what it did get to.");
+    }
+
+    report::describe_run(&run.journal, out, None);
+    Ok(())
+}
+
+fn merge(analyses: &[PathBuf], out: &Path, replace: bool) -> Result<(), scrub_run::RunError> {
+    scrub_run::check_output_is_free(out, replace)?;
+
+    let (analysis, merged) = scrub_run::merge(analyses, machine::identity()?)?;
+    analysis.write(out, scrub_run::replacement(replace))?;
+
+    report::describe_comparison(&merged, &analysis, out);
     Ok(())
 }
 
@@ -576,161 +337,7 @@ enum KeepRule {
     Shallowest,
 }
 
-fn plan(
-    analysis_path: &std::path::Path,
-    keep: KeepRule,
-    prefer: Option<PathBuf>,
-    out: &std::path::Path,
-    replace: bool,
-) -> Result<(), String> {
-    check_output_is_free(out, replace)?;
-
-    let analysis = scrub_store::Analysis::read(analysis_path)
-        .map_err(|error| format!("could not read {}: {error}", analysis_path.display()))?;
-
-    // A comparison of several machines describes no single machine, so no single
-    // machine can carry out a plan made from it (DR-18).
-    if matches!(
-        analysis.header.machine,
-        scrub_core::artifact::MachineScope::Merged { .. }
-    ) {
-        return Err(
-            "this is a comparison of several machines, and a plan has to be about one. \
-             Plan from each machine's own analysis instead."
-                .to_owned(),
-        );
-    }
-
-    let rule = match prefer {
-        Some(path) => scrub_core::plan::Keep::Under(path),
-        None => match keep {
-            KeepRule::Oldest => scrub_core::plan::Keep::Oldest,
-            KeepRule::Newest => scrub_core::plan::Keep::Newest,
-            KeepRule::Shallowest => scrub_core::plan::Keep::Shallowest,
-        },
-    };
-
-    let operations = scrub_core::plan::ordered(scrub_core::plan::resolve_duplicates(
-        &analysis.body.outcome.entries,
-        &analysis.groups,
-        &rule,
-    ));
-
-    let parent = analysis.header.content_digest;
-    let mut drafted = scrub_store::Plan {
-        header: header_for(
-            Stage::Plan,
-            vec![parent],
-            analysis.header.scope_digest,
-            scrub_core::artifact::Digest::of(b"placeholder"),
-        )?,
-        body: analysis.body,
-        operations,
-    };
-    drafted.header.machine = analysis.header.machine;
-    drafted.header.content_digest = drafted.content_digest();
-
-    drafted
-        .write(out, replacement(replace))
-        .map_err(|error| error.to_string())?;
-
-    report::describe_plan(&drafted, &rule, Some(out));
-    Ok(())
-}
-
-fn merge(analyses: &[PathBuf], out: &std::path::Path, replace: bool) -> Result<(), String> {
-    check_output_is_free(out, replace)?;
-    if analyses.len() < 2 {
-        return Err(
-            "merging needs at least two analyses; combining one with nothing would \
-             produce a second artifact claiming to be a comparison"
-                .to_owned(),
-        );
-    }
-
-    let mut inputs = Vec::with_capacity(analyses.len());
-    let mut parents = Vec::with_capacity(analyses.len());
-    let mut encoding = None;
-
-    for path in analyses {
-        let analysis = scrub_store::Analysis::read(path)
-            .map_err(|error| format!("could not read {}: {error}", path.display()))?;
-        parents.push(analysis.header.content_digest);
-        encoding.get_or_insert(analysis.body.path_encoding);
-
-        inputs.push(scrub_core::merge::Input {
-            label: label_for(path),
-            machine: match analysis.header.machine {
-                MachineScope::Single { machine } => machine,
-                MachineScope::Merged { .. } => {
-                    return Err(format!(
-                        "{} is itself a comparison; merge the original analyses instead, \
-                         so every machine is counted once",
-                        path.display()
-                    ));
-                }
-            },
-            roots: analysis.body.detection.roots,
-            links: analysis.body.detection.links,
-            outcome: analysis.body.outcome,
-            settled: analysis.settled,
-        });
-    }
-
-    let merged = scrub_core::merge::merge(inputs);
-    let settled: std::collections::HashMap<_, _> = merged.settled.clone().into_iter().collect();
-    let groups = scrub_core::analysis::group_duplicates(&merged.outcome.entries, &settled);
-
-    let body = scrub_store::Body {
-        path_encoding: encoding.unwrap_or(scrub_core::paths::LOCAL),
-        detection: scrub_core::cloud::Detection {
-            roots: merged.roots.clone(),
-            links: merged.links.clone(),
-        },
-        outcome: merged.outcome.clone(),
-    };
-
-    let mut header = header_for(
-        Stage::Merge,
-        parents,
-        scrub_core::artifact::Digest::of(b"combined"),
-        scrub_core::artifact::Digest::of(b"placeholder"),
-    )?;
-    // A comparison describes several machines, so it can be read anywhere and
-    // executed nowhere (DR-18).
-    header.machine = MachineScope::Merged {
-        machines: merged.sources.iter().map(|source| source.machine).collect(),
-    };
-
-    let mut analysis = scrub_store::Analysis {
-        header,
-        body,
-        groups,
-        settled: merged.settled.clone(),
-    };
-    analysis.header.content_digest = analysis.content_digest();
-
-    analysis
-        .write(out, replacement(replace))
-        .map_err(|error| error.to_string())?;
-
-    report::describe_comparison(&merged, &analysis, out);
-    Ok(())
-}
-
-/// What to call a machine in the comparison.
-///
-/// Taken from the artifact's file name, because a machine identity is a random
-/// value that means nothing to anyone reading a report, and asking for a label
-/// every time would be a question with an obvious answer.
-fn label_for(path: &std::path::Path) -> String {
-    path.file_stem().map_or_else(
-        || path.display().to_string(),
-        |stem| stem.to_string_lossy().into_owned(),
-    )
-}
-
-fn inspect(artifact: &std::path::Path) -> Result<(), String> {
+fn inspect(artifact: &Path) -> Result<(), scrub_run::RunError> {
     // Each artifact is the one before it with more in it, so trying the richest
     // first tells us which we were handed without asking the caller to say.
     if let Ok(run) = scrub_store::Journal::read(artifact)
@@ -766,35 +373,28 @@ fn inspect(artifact: &std::path::Path) -> Result<(), String> {
         return Ok(());
     }
 
-    let inventory = Inventory::read(artifact)
-        .map_err(|error| format!("could not read {}: {error}", artifact.display()))?;
+    let inventory = Inventory::read(artifact)?;
     report::describe_header(&inventory.header, inventory.is_native());
     report::describe_body(&inventory.body, None);
     Ok(())
 }
 
-fn export(artifact: &std::path::Path, out: Option<&std::path::Path>) -> Result<(), String> {
-    let inventory = Inventory::read(artifact)
-        .map_err(|error| format!("could not read {}: {error}", artifact.display()))?;
+fn export(artifact: &Path, out: Option<&Path>) -> Result<(), scrub_run::RunError> {
+    let inventory = Inventory::read(artifact)?;
 
     if let Some(path) = out {
         // DR-11-EXEMPT: a destination the user named on the command line for the
         // tool's own output, never a path discovered by a scan.
-        let file = std::fs::File::create(path)
-            .map_err(|error| format!("could not create {}: {error}", path.display()))?;
+        let file = std::fs::File::create(path).map_err(|error| {
+            scrub_run::RunError::new(format!("could not create {}: {error}", path.display()))
+        })?;
         let mut writer = std::io::BufWriter::new(file);
         return scrub_store::write_ndjson(&inventory, &mut writer)
-            .map_err(|error| error.to_string());
+            .map_err(|error| scrub_run::RunError::new(error.to_string()));
     }
 
     let stdout = std::io::stdout();
     let mut writer = std::io::BufWriter::new(stdout.lock());
-    scrub_store::write_ndjson(&inventory, &mut writer).map_err(|error| error.to_string())
-}
-
-fn home_directory() -> Result<PathBuf, String> {
-    let key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
-    std::env::var_os(key)
-        .map(PathBuf::from)
-        .ok_or_else(|| format!("{key} is not set, so there is no home directory to scan"))
+    scrub_store::write_ndjson(&inventory, &mut writer)
+        .map_err(|error| scrub_run::RunError::new(error.to_string()))
 }

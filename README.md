@@ -80,6 +80,31 @@ Full detail: [`docs/PIPELINE.md`](docs/PIPELINE.md).
 
 ## Trying it
 
+There are two ways in, and they run the same code. The window is the one to
+start with; the command line does everything the window does and is what you
+want if you would rather script than click.
+
+### The window
+
+```bash
+cd apps/desktop
+pnpm install
+pnpm tauri dev        # or `pnpm tauri build` for an application you can keep
+```
+
+Three steps, in order. **Discover** says what this machine synchronises and,
+before any other number, which folders sit inside a cloud directory without
+being backed up. **Organize** finds what is duplicated, shows each set as one
+row, and lets you choose which copy to keep. **Apply** checks every step against
+the disk, shows you the list, asks once in plain words, and only then moves
+anything — into a quarantine folder, never to a wastebasket, with a record that
+puts it all back.
+
+Artifacts are kept in the platform's application-data directory, or wherever you
+point `SCRUB_WORKSPACE`.
+
+### The command line
+
 ```bash
 cargo build --release -p scrub-cli
 

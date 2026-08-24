@@ -8,12 +8,10 @@ use std::io::{IsTerminal as _, Write as _};
 use std::path::Path;
 use std::time::Instant;
 
-use std::collections::HashMap;
-
-use scrub_core::analysis::{Certainty, Settled};
+use scrub_core::analysis::Certainty;
 use scrub_core::artifact::ArtifactHeader;
 use scrub_core::cloud::{CloudMap, LinkVerdict, Residency};
-use scrub_core::inventory::{Entry, EntryKind, ScanOutcome, UnreadReason};
+use scrub_core::inventory::{EntryKind, ScanOutcome, UnreadReason};
 use scrub_core::plan::Keep;
 use scrub_store::{Analysis, Body};
 
@@ -65,23 +63,21 @@ pub fn describe_providers(map: &CloudMap) {
     println!();
 }
 
-/// Progress while a scan runs.
-pub struct Progress {
+/// Draws progress on a terminal, and only on a terminal.
+///
+/// Progress redraws in place with a carriage return, which means something to a
+/// terminal and nothing to a file. Piped somewhere it would produce one unbroken
+/// line of noise, so it is simply not drawn there.
+pub struct Terminal {
     quiet: bool,
     started: Instant,
     last_drawn: Instant,
 }
 
-impl Progress {
-    pub fn new(quiet: bool, root: &Path) -> Self {
-        // Progress redraws in place with a carriage return, which only means
-        // anything to a terminal. Piped to a file or another program it produces
-        // one unbroken line of noise, so it is simply not drawn there.
+impl Terminal {
+    pub fn new(quiet: bool) -> Self {
         let quiet = quiet || !std::io::stdout().is_terminal();
         let now = Instant::now();
-        if !quiet {
-            println!("Scanning {}", root.display());
-        }
         Self {
             quiet,
             started: now,
@@ -89,152 +85,85 @@ impl Progress {
         }
     }
 
-    /// Redraws at most a few times a second.
+    /// Whether enough time has passed to be worth redrawing.
     ///
     /// A scan reads tens of thousands of directories a second; drawing on each
     /// one would spend more time on the terminal than on the filesystem.
-    pub fn update(&mut self, state: &scrub_platform::walk::Progress<'_>) {
+    fn due(&mut self) -> bool {
         if self.quiet || self.last_drawn.elapsed().as_millis() < 250 {
-            return;
+            return false;
         }
         self.last_drawn = Instant::now();
-        print!("\r  {} found, {} unreadable…  ", state.found, state.unread);
-        let _ = std::io::stdout().flush();
+        true
     }
 
-    pub fn finish(&self, outcome: &ScanOutcome) {
-        if self.quiet {
-            return;
+    fn clear(&self) {
+        if !self.quiet {
+            print!("\r{}\r", " ".repeat(48));
+            let _ = std::io::stdout().flush();
         }
-        println!(
-            "\r  {} entries in {:.1?}{}",
-            outcome.entries.len(),
-            self.started.elapsed(),
-            " ".repeat(20)
-        );
     }
 }
 
-/// Runs the two reading passes, reporting as it goes.
-///
-/// The first reads each candidate's two ends — its whole content, for anything
-/// small enough that seeking would cost more than reading. That separates almost
-/// everything which merely shares a size. Only what survives is read through.
-pub fn run_passes(
-    entries: &[Entry],
-    mode: &scrub_platform::ScanMode,
-    quiet: bool,
-    thorough: bool,
-) -> HashMap<usize, Settled> {
-    let candidates = if thorough {
-        scrub_core::analysis::all_readable(entries)
-    } else {
-        scrub_core::analysis::readable_candidates(entries)
-    };
-    if !quiet {
-        if thorough {
-            println!(
-                "{} files can be read here, and all of them will be — \
-                 comparison needs a fingerprint for each.",
-                candidates.len()
-            );
-        } else {
-            println!(
-                "{} files share a size with another and can be read here.",
-                candidates.len()
-            );
-        }
-    }
-
-    let sampled = read_pass(entries, &candidates, mode, quiet, "sampling", true);
-
-    // A file small enough to have been read through already has its content
-    // digest; a larger one has only a fingerprint, which is not identity.
-    let mut settled: HashMap<usize, Settled> = sampled
-        .iter()
-        .map(|(index, digest)| {
-            let complete = entries[*index].logical_size
-                <= scrub_platform::digest::SAMPLE_READS_WHOLE_FILE_UP_TO;
-            let settled = if complete {
-                Settled::Content(*digest)
-            } else {
-                Settled::DistinctBySample(*digest)
-            };
-            (*index, settled)
-        })
-        .collect();
-
-    // Grouping on samples decides only what is worth reading in full. Treating a
-    // sample as identity here is safe because nothing acts on the result; the
-    // groups that survive are read through before anything is concluded.
-    let provisional: HashMap<usize, Settled> = sampled
-        .iter()
-        .map(|(index, digest)| (*index, Settled::Content(*digest)))
-        .collect();
-    let confirm: Vec<usize> = scrub_core::analysis::needing_full_read(
-        &scrub_core::analysis::group_duplicates(entries, &provisional),
-    )
-    .into_iter()
-    .filter(|index| {
-        entries[*index].logical_size > scrub_platform::digest::SAMPLE_READS_WHOLE_FILE_UP_TO
-    })
-    .collect();
-
-    if !quiet {
-        println!(
-            "  {} are large enough to need reading in full.",
-            confirm.len()
-        );
-    }
-    for (index, digest) in read_pass(entries, &confirm, mode, quiet, "reading", false) {
-        settled.insert(index, Settled::Content(digest));
-    }
-
-    settled
-}
-
-fn read_pass(
-    entries: &[Entry],
-    indices: &[usize],
-    mode: &scrub_platform::ScanMode,
-    quiet: bool,
-    label: &str,
-    sample: bool,
-) -> HashMap<usize, scrub_core::artifact::Digest> {
-    let mut digests = HashMap::with_capacity(indices.len());
-    let show = !quiet && std::io::stdout().is_terminal();
-    let mut last_drawn = Instant::now();
-
-    for (done, index) in indices.iter().enumerate() {
-        let entry = &entries[*index];
-        let outcome = if sample {
-            scrub_platform::digest::quick_digest(
-                &entry.path,
-                &entry.cloud,
-                entry.logical_size,
-                mode,
-            )
-        } else {
-            scrub_platform::digest::full_digest(&entry.path, &entry.cloud, entry.logical_size, mode)
-        };
-        // A refusal is not reported loudly here: the file stays unsettled, and
-        // the group it belongs to says why.
-        if let Ok(digest) = outcome {
-            digests.insert(*index, digest);
-        }
-
-        if show && last_drawn.elapsed().as_millis() >= 250 {
-            last_drawn = Instant::now();
-            print!("\r  {label}: {done}/{}    ", indices.len());
+impl scrub_run::Watch for Terminal {
+    fn walking(&mut self, _root: &Path, state: &scrub_platform::walk::Progress<'_>) {
+        if self.due() {
+            print!("\r  {} found, {} unreadable…  ", state.found, state.unread);
             let _ = std::io::stdout().flush();
         }
     }
 
-    if show {
-        print!("\r{}\r", " ".repeat(40));
-        let _ = std::io::stdout().flush();
+    fn walked(&mut self, root: &Path, outcome: &ScanOutcome) {
+        if self.quiet {
+            return;
+        }
+        self.clear();
+        println!(
+            "Scanned {}: {} entries in {:.1?}",
+            root.display(),
+            outcome.entries.len(),
+            self.started.elapsed()
+        );
     }
-    digests
+
+    fn pass_begins(&mut self, pass: scrub_run::Pass, total: usize) {
+        if self.quiet {
+            return;
+        }
+        match pass {
+            scrub_run::Pass::Sampling => println!(
+                "{total} file(s) could hold a duplicate, and a little of each will be read."
+            ),
+            scrub_run::Pass::Reading => {
+                println!("  {total} are large enough to need reading in full.");
+            }
+        }
+    }
+
+    fn reading(&mut self, pass: scrub_run::Pass, done: usize, _bytes: u64) {
+        if self.due() {
+            let label = match pass {
+                scrub_run::Pass::Sampling => "sampling",
+                scrub_run::Pass::Reading => "reading",
+            };
+            print!("\r  {label}: {done}    ");
+            let _ = std::io::stdout().flush();
+        }
+    }
+
+    fn pass_ends(&mut self, _pass: scrub_run::Pass) {
+        self.clear();
+    }
+
+    fn operating(&mut self, done: usize, total: usize) {
+        if self.due() {
+            print!("\r  {done}/{total}    ");
+            let _ = std::io::stdout().flush();
+        }
+        if done == total {
+            self.clear();
+        }
+    }
 }
 
 /// Prints what an analysis concluded.

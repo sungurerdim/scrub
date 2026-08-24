@@ -9,13 +9,15 @@ use std::path::PathBuf;
 
 use scrub_core::artifact::MachineId;
 
+use crate::RunError;
+
 /// Reads this machine's identity, creating one on first run.
 ///
 /// # Errors
 ///
 /// Returns a message naming the path involved if the identity could not be read
 /// or written.
-pub fn identity() -> Result<MachineId, String> {
+pub fn identity() -> Result<MachineId, crate::RunError> {
     let file = configuration_directory()?.join("machine-id");
 
     // DR-11-EXEMPT: the tool's own configuration file, never a scanned path.
@@ -27,16 +29,17 @@ pub fn identity() -> Result<MachineId, String> {
 
     let fresh = MachineId::generate();
     let encoded = serde_json::to_string(&fresh)
-        .map_err(|error| format!("could not encode an identity: {error}"))?;
+        .map_err(|error| RunError::new(format!("could not encode an identity: {error}")))?;
 
     // DR-11-EXEMPT: as above.
     if let Some(parent) = file.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+        std::fs::create_dir_all(parent).map_err(|error| {
+            RunError::new(format!("could not create {}: {error}", parent.display()))
+        })?;
     }
     // DR-11-EXEMPT: as above.
     std::fs::write(&file, encoded)
-        .map_err(|error| format!("could not write {}: {error}", file.display()))?;
+        .map_err(|error| RunError::new(format!("could not write {}: {error}", file.display())))?;
     Ok(fresh)
 }
 
@@ -44,11 +47,13 @@ pub fn identity() -> Result<MachineId, String> {
 ///
 /// Resolved from the environment rather than from a crate, because the rule is
 /// three lines long and a dependency is a thing to keep updated forever.
-fn configuration_directory() -> Result<PathBuf, String> {
+fn configuration_directory() -> Result<PathBuf, RunError> {
     if cfg!(windows) {
         return std::env::var_os("APPDATA")
             .map(|base| PathBuf::from(base).join("scrub"))
-            .ok_or_else(|| "APPDATA is not set, so there is nowhere to keep settings".to_owned());
+            .ok_or_else(|| {
+                RunError::new("APPDATA is not set, so there is nowhere to keep settings")
+            });
     }
 
     if let Some(base) = std::env::var_os("XDG_CONFIG_HOME") {
@@ -57,5 +62,5 @@ fn configuration_directory() -> Result<PathBuf, String> {
 
     std::env::var_os("HOME")
         .map(|home| PathBuf::from(home).join(".config/scrub"))
-        .ok_or_else(|| "HOME is not set, so there is nowhere to keep settings".to_owned())
+        .ok_or_else(|| RunError::new("HOME is not set, so there is nowhere to keep settings"))
 }

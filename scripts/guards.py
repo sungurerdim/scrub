@@ -36,6 +36,41 @@ FS_ALLOWED_CRATES = {"scrub-platform"}
 def is_test_file(path: Path) -> bool:
     return "tests" in path.relative_to(ROOT).parts
 
+
+# A `#[cfg(test)]` module is test code that happens to live beside the code it
+# tests, and the reasoning above applies to it word for word. The alternative —
+# an exemption comment on every fixture line — is the noise that teaches people
+# to add exemptions reflexively.
+CFG_TEST = re.compile(r"^\s*#\[cfg\(test\)\]")
+# Braces inside strings and comments are not scope. Stripping them keeps a
+# fixture like `write(path, b"{")` from extending the module past its end, which
+# would exempt code that is not test code.
+STRING_OR_COMMENT = re.compile(r'"(?:[^"\\]|\\.)*"|//.*$')
+
+
+def test_module_lines(lines: list[str]) -> set[int]:
+    """Line numbers (1-based) inside a `#[cfg(test)]` module."""
+    inside: set[int] = set()
+    number = 0
+    while number < len(lines):
+        if not CFG_TEST.match(lines[number]):
+            number += 1
+            continue
+
+        # Walk to the module's opening brace, then out again by counting.
+        depth = 0
+        started = False
+        while number < len(lines):
+            bare = STRING_OR_COMMENT.sub("", lines[number])
+            depth += bare.count("{") - bare.count("}")
+            if "{" in bare:
+                started = True
+            inside.add(number + 1)
+            number += 1
+            if started and depth <= 0:
+                break
+    return inside
+
 # Escape hatch for lines that provably touch a path the tool itself owns — an
 # artifact file, a config file — rather than user data.
 EXEMPT = "DR-11-EXEMPT:"
@@ -49,12 +84,23 @@ def fail(message: str) -> None:
 
 
 def rust_sources() -> list[Path]:
-    return sorted(p for p in (ROOT / "crates").rglob("*.rs") if "/target/" not in str(p))
+    """Every Rust file in the project, wherever it lives.
+
+    The desktop application is outside `crates/` and is exactly as capable of
+    reaching for the filesystem as anything else, so it is watched too.
+    """
+    roots = [ROOT / "crates", ROOT / "apps"]
+    found: list[Path] = []
+    for root in roots:
+        if root.exists():
+            found += [p for p in root.rglob("*.rs") if "/target/" not in str(p)]
+    return sorted(found)
 
 
 def crate_of(path: Path) -> str:
-    relative = path.relative_to(ROOT / "crates")
-    return relative.parts[0]
+    relative = path.relative_to(ROOT)
+    # crates/<name>/... or apps/<app>/<crate>/...
+    return relative.parts[1] if relative.parts[0] == "crates" else relative.parts[-3]
 
 
 def guard_filesystem_access() -> None:
@@ -64,8 +110,11 @@ def guard_filesystem_access() -> None:
         if crate_of(source) in FS_ALLOWED_CRATES or is_test_file(source):
             continue
         lines = source.read_text(encoding="utf-8").splitlines()
+        in_tests = test_module_lines(lines)
         for number, line in enumerate(lines, start=1):
             if not UNGUARDED_FS.search(line):
+                continue
+            if number in in_tests:
                 continue
             if EXEMPT in line or exempted_by_comment_above(lines, number):
                 continue

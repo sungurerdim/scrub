@@ -1,0 +1,36 @@
+[package]
+name = "scrub-desktop"
+description = "The desktop interface for scrub"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+name = "scrub_desktop"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.6.3", features = [] }
+
+[dependencies]
+scrub-core = { path = "../../../crates/scrub-core" }
+scrub-platform = { path = "../../../crates/scrub-platform" }
+scrub-store = { path = "../../../crates/scrub-store" }
+scrub-run = { path = "../../../crates/scrub-run" }
+tauri = { version = "2.11.5", features = [] }
+tauri-plugin-dialog = "2.7.2"
+serde.workspace = true
+serde_json.workspace = true
+jiff.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+# Runs the command layer without a display, so the pipeline the window drives is
+# covered by the same gate everything else is.
+tauri = { version = "2.11.5", features = ["test"] }

@@ -38,14 +38,16 @@ else
   # which is the only part that wants an assembler we do not have.
   #
   # Requires, once:  rustup target add x86_64-pc-windows-msvc aarch64-pc-windows-msvc
-  # scrub-store and scrub-cli are excluded: storage bundles SQLite's C source,
-  # which would need a Windows C compiler, and the command line depends on it.
-  # Nothing Windows-specific lives in either — every line that differs per
-  # platform is in scrub-platform, which stays covered.
+  # Four crates are excluded: storage bundles SQLite's C source, which would
+  # need a Windows C compiler, and the driver, the command line and the desktop
+  # application all depend on it. Nothing Windows-specific lives in any of them
+  # — every line that differs per platform is in scrub-platform, which stays
+  # covered.
   for target in x86_64-pc-windows-msvc aarch64-pc-windows-msvc; do
     step "cross-check $target"
-    cargo check --workspace --exclude scrub-store --exclude scrub-cli \
-      --all-targets --target "$target" --features scrub-core/portable-hash
+    cargo check --workspace --exclude scrub-store --exclude scrub-run \
+      --exclude scrub-cli --exclude scrub-desktop --all-targets \
+      --target "$target" --features scrub-core/portable-hash
   done
 fi
 

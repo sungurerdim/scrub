@@ -7,11 +7,13 @@ crates/
   scrub-core/       vocabulary · artifact schema · chain integrity · rule engine
   scrub-platform/   cloud state · dataless detection · traversal      one module per platform
   scrub-store/      artifacts as SQLite, and the canonical digest
-  scrub-engine/     preflight · apply · quarantine · journal · undo   [Phase 2]
+  scrub-run/        drives each stage, so every interface runs the same one
   scrub-providers/  read-only Drive and Graph clients, user-owned credentials   [Phase 3]
   scrub-photos/     PhotoKit bridge, macOS only, feature-gated        [Phase 4]
   scrub-cli/        every stage as a command
-apps/desktop/       Tauri shell + web interface
+apps/desktop/       Tauri window + web interface
+  src/              the three screens
+  src-tauri/        the commands the window can call, and nothing else
 ```
 
 `scrub-core` holds no I/O at all and depends on nothing heavy. `scrub-platform`
@@ -28,9 +30,45 @@ type-checked for both Windows architectures from a Mac.
 Given the same inventory, the core produces the same analysis on any machine
 (DR-12), which is what makes golden-file testing possible.
 
-The command line exists so every stage can be driven and checked by machine, not
-as a second product surface. The graphical interface will be a thin layer over
-the same crates, with no logic of its own.
+## One driver, two interfaces
+
+`scrub-run` exists because the command line and the window are two ways of
+asking for the same work. If each drove the stages itself they would drift — one
+would gain a check the other lacked — and two artifacts claiming the same stage
+would stop meaning the same thing. So the driving lives in one crate, and both
+callers get the identical artifact.
+
+Nothing in `scrub-run` prints or draws. Progress goes to a `Watch`, which the
+caller implements: the command line redraws a line on a terminal, the window
+sends an event and moves a bar. A caller wanting neither uses `Silent`.
+
+The command line is not a lesser surface. It exists so every stage can be driven
+and checked by machine, and so the artifacts are usable by anyone who would
+rather script than click.
+
+## The window
+
+Three screens, in the order the pipeline runs: **Discover** (what is here, and
+what is not backed up), **Organize** (what is duplicated, and what to do), and
+**Apply** (check it, then carry it out). Only the last one changes anything, and
+only after showing every step and asking in words that name the file count and
+the space involved.
+
+The window holds no rules of its own. It does not decide what a duplicate is,
+what may be moved, or what must be checked first; it asks, and shows the answer.
+What it does hold is the presentation decisions: a group of duplicates crosses
+the boundary as one row with a count, and its copies are fetched only if
+somebody opens it (DR-21). The list is virtualised, because a real machine
+produces tens of thousands of rows.
+
+The commands the window may call are declared twice on purpose — in `build.rs`
+and in `capabilities/default.json` — so the reachable surface is written down
+where it can be reviewed, and adding to it is a deliberate act (DR-4).
+
+Artifacts go to the platform's application-data directory, or to `SCRUB_WORKSPACE`
+where somebody wants them on another disk. That directory is the whole of the
+tool's state: deleting it loses nothing but the need to scan again, and it holds
+no copy of anybody's files (DR-3).
 
 ## Platform layer
 
@@ -142,31 +180,33 @@ above is the baseline any such change has to beat by enough to be worth it.
 ## Stack
 
 Every version below was verified against its registry on 2026-08-24 and is pinned
-in `Cargo.toml` and `package.json`. Rows below the command line are chosen but
-not yet in use; they arrive with the stage that needs them.
+in `Cargo.toml` and `package.json`. Rows marked *later* are chosen but not yet in
+use; they arrive with the stage that needs them.
 
 | Concern | Choice | Version |
 |---|---|---|
 | Core language | Rust, edition 2024 | 1.98 |
-| Desktop shell | Tauri | 2.11 |
+| Desktop shell | Tauri · tauri-plugin-dialog | 2.11 · 2.7 |
 | Interface | React · TypeScript · Vite · Tailwind | 19.2 · 7.0 · 8.2 · 4.3 |
-| Virtualized tables and trees | TanStack Virtual · Table | 3.14 · 9.1 |
+| Virtualized lists | TanStack Virtual | 3.14 |
 | Artifacts | SQLite via rusqlite, bundled | 0.40 |
 | Content digest | blake3 | 1.8 |
-| Perceptual image hashing | image_hasher | 3.1 |
-| Content type detection | infer · file-format | 0.22 · 0.29 |
-| Document text extraction | pdf-extract · docx-rs | 0.12 · 0.4 |
-| System trash | trash | 5.2 |
-| Credential storage | keyring, OS keychain | 4.1 |
-| macOS system bindings | objc2 · objc2-photos | 0.6 · 0.3 |
-| Windows system bindings | windows | 0.62 |
+| Perceptual image hashing | image_hasher | 3.1 · *later* |
+| Content type detection | infer · file-format | 0.22 · 0.29 · *later* |
+| Document text extraction | pdf-extract · docx-rs | 0.12 · 0.4 · *later* |
+| Credential storage | keyring, OS keychain | 4.1 · *later* |
+| macOS system bindings | objc2 · objc2-photos | 0.6 · 0.3 · *later* |
+| Windows system bindings | windows | 0.62 · *later* |
 | Command line | clap | 4.6 |
 | Timestamps | jiff | 0.2 |
 
-Two notes on selection. `img_hash` is the commonly recommended perceptual hashing
-crate and has been unmaintained since 2021; we use the maintained fork
+Three notes on selection. `img_hash` is the commonly recommended perceptual
+hashing crate and has been unmaintained since 2021; we use the maintained fork
 `image_hasher` instead. `kamadak-exif` was last released in 2024 — mature, but we
-record that as a known staleness rather than discovering it later.
+record that as a known staleness rather than discovering it later. The `trash`
+crate was listed here and has been dropped: quarantine is a directory whose
+contents leave it only when somebody empties it deliberately, and a system trash
+that empties itself on a schedule is a worse promise than the one DR-5 makes.
 
 **Interface stack rationale.** Tauri renders a web interface inside the operating
 system's own webview. This gives us the ergonomics of web UI — rich visuals, fast

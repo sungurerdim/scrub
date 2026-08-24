@@ -1,6 +1,6 @@
 [package]
-name = "scrub-cli"
-description = "Every stage of scrub as a command"
+name = "scrub-run"
+description = "Drives each stage of the pipeline, so every interface runs the same one"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,22 +8,15 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
-[[bin]]
-name = "scrub"
-path = "src/main.rs"
-
 [dependencies]
 scrub-core = { path = "../scrub-core" }
 scrub-platform = { path = "../scrub-platform" }
 scrub-store = { path = "../scrub-store" }
-scrub-run = { path = "../scrub-run" }
-clap.workspace = true
 serde_json.workspace = true
 jiff.workspace = true
 
-[dev-dependencies]
-tempfile.workspace = true
-serde_json.workspace = true
-
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

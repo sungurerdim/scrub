@@ -4,7 +4,9 @@ members = [
     "crates/scrub-core",
     "crates/scrub-platform",
     "crates/scrub-store",
+    "crates/scrub-run",
     "crates/scrub-cli",
+    "apps/desktop/src-tauri",
 ]
 
 [workspace.package]
