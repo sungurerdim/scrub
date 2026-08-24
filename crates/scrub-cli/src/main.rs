@@ -37,6 +37,9 @@ enum Command {
         /// Do not print progress while scanning.
         #[arg(long)]
         quiet: bool,
+        /// Write over an artifact already at that path.
+        #[arg(long)]
+        replace: bool,
     },
     /// Work out what is the same file as what, reading only what is already here.
     Analyze {
@@ -48,6 +51,9 @@ enum Command {
         /// Do not print progress while reading.
         #[arg(long)]
         quiet: bool,
+        /// Write over an artifact already at that path.
+        #[arg(long)]
+        replace: bool,
     },
     /// Summarise an artifact.
     Inspect {
@@ -67,12 +73,18 @@ enum Command {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let outcome = match cli.command {
-        Command::Scan { paths, out, quiet } => scan(paths, &out, quiet),
+        Command::Scan {
+            paths,
+            out,
+            quiet,
+            replace,
+        } => scan(paths, &out, quiet, replace),
         Command::Analyze {
             inventory,
             out,
             quiet,
-        } => analyze(&inventory, &out, quiet),
+            replace,
+        } => analyze(&inventory, &out, quiet, replace),
         Command::Inspect { artifact } => inspect(&artifact),
         Command::Export { artifact, out } => export(&artifact, out.as_deref()),
     };
@@ -86,7 +98,14 @@ fn main() -> ExitCode {
     }
 }
 
-fn scan(paths: Vec<PathBuf>, out: &std::path::Path, quiet: bool) -> Result<(), String> {
+fn scan(
+    paths: Vec<PathBuf>,
+    out: &std::path::Path,
+    quiet: bool,
+    replace: bool,
+) -> Result<(), String> {
+    check_output_is_free(out, replace)?;
+
     // Before anything else: ask the platform to make an accidental download
     // impossible. If it refuses, the scan does not start — proceeding would risk
     // pulling a user's archive down over a metered connection (DR-11).
@@ -130,11 +149,35 @@ fn scan(paths: Vec<PathBuf>, out: &std::path::Path, quiet: bool) -> Result<(), S
     };
 
     inventory
-        .write(out)
-        .map_err(|error| format!("could not write {}: {error}", out.display()))?;
+        .write(out, replacement(replace))
+        .map_err(|error| error.to_string())?;
 
     report::describe_body(&inventory.body, Some(out));
     Ok(())
+}
+
+/// Refuses an occupied output before any work is done.
+///
+/// The same refusal happens at the moment of writing, which is where the
+/// invariant belongs. This one exists so that a scan of two million files does
+/// not run to completion before announcing that its output name was taken.
+fn check_output_is_free(out: &std::path::Path, replace: bool) -> Result<(), String> {
+    if replace || !out.exists() {
+        return Ok(());
+    }
+    Err(format!(
+        "{} already exists, and nothing is overwritten without being asked. \
+         Choose another name, or pass --replace to write over it.",
+        out.display()
+    ))
+}
+
+fn replacement(replace: bool) -> scrub_store::Replace {
+    if replace {
+        scrub_store::Replace::Yes
+    } else {
+        scrub_store::Replace::Never
+    }
 }
 
 /// Builds the header every artifact this run produces.
@@ -163,7 +206,10 @@ fn analyze(
     inventory_path: &std::path::Path,
     out: &std::path::Path,
     quiet: bool,
+    replace: bool,
 ) -> Result<(), String> {
+    check_output_is_free(out, replace)?;
+
     // Analysis reads file content, so the same guard the scan starts under
     // applies here with more force (DR-11).
     let mode = scrub_platform::enter_read_only_scan_mode().map_err(|error| error.to_string())?;
@@ -197,8 +243,8 @@ fn analyze(
     };
 
     analysis
-        .write(out)
-        .map_err(|error| format!("could not write {}: {error}", out.display()))?;
+        .write(out, replacement(replace))
+        .map_err(|error| error.to_string())?;
 
     report::describe_groups(&analysis, Some(out));
     Ok(())

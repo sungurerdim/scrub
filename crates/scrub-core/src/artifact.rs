@@ -15,10 +15,17 @@ use uuid::Uuid;
 
 /// The artifact schema this build reads and writes.
 ///
-/// Bumped whenever the on-disk shape of any artifact changes in a way an older
-/// build could misread. Artifacts declaring a different value are rejected
-/// rather than interpreted.
-pub const SCHEMA_VERSION: u32 = 1;
+/// Bumped whenever the on-disk shape of an artifact changes, **or** whenever the
+/// canonical form its digest is taken over changes. The second half is easy to
+/// forget and expensive to get wrong: an artifact written before such a change
+/// still has its old digest recorded, so the only thing distinguishing "this
+/// tool changed" from "somebody edited your file" is this number.
+///
+/// History:
+/// - 1 — first shape.
+/// - 2 — path bytes stored only where the text form is inexact; the digest
+///   covers analysis groups as well as the scan body.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// A BLAKE3-256 digest.
 ///

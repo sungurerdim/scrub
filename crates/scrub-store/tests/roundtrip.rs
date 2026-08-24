@@ -139,7 +139,9 @@ fn an_artifact_survives_being_written_and_read() {
     let file = directory.path().join("scan.inventory");
 
     let original = sample();
-    original.write(&file).expect("the artifact must write");
+    original
+        .write(&file, scrub_store::Replace::Never)
+        .expect("the artifact must write");
     let recovered = Inventory::read(&file).expect("the artifact must read back");
 
     assert_eq!(original, recovered);
@@ -154,7 +156,9 @@ fn a_path_that_is_not_valid_text_comes_back_byte_for_byte() {
     let file = directory.path().join("scan.inventory");
 
     let original = sample();
-    original.write(&file).expect("write");
+    original
+        .write(&file, scrub_store::Replace::Never)
+        .expect("write");
     let recovered = Inventory::read(&file).expect("read");
 
     for (before, after) in original
@@ -176,7 +180,9 @@ fn an_identity_beyond_the_signed_range_is_preserved() {
     let directory = tempfile::tempdir().expect("a temporary directory");
     let file = directory.path().join("scan.inventory");
 
-    sample().write(&file).expect("write");
+    sample()
+        .write(&file, scrub_store::Replace::Never)
+        .expect("write");
     let recovered = Inventory::read(&file).expect("read");
 
     let identity = recovered
@@ -197,7 +203,9 @@ fn the_digest_does_not_depend_on_having_been_stored() {
 
     let original = sample();
     let before = original.content_digest();
-    original.write(&file).expect("write");
+    original
+        .write(&file, scrub_store::Replace::Never)
+        .expect("write");
     let after = Inventory::read(&file).expect("read").content_digest();
 
     assert_eq!(
@@ -213,7 +221,9 @@ fn content_edited_after_writing_is_refused() {
     // downstream may act on it.
     let directory = tempfile::tempdir().expect("a temporary directory");
     let file = directory.path().join("scan.inventory");
-    sample().write(&file).expect("write");
+    sample()
+        .write(&file, scrub_store::Replace::Never)
+        .expect("write");
 
     let connection = rusqlite::Connection::open(&file).expect("open for editing");
     connection
@@ -232,7 +242,9 @@ fn content_edited_after_writing_is_refused() {
 fn an_artifact_from_this_machine_is_usable_here() {
     let directory = tempfile::tempdir().expect("a temporary directory");
     let file = directory.path().join("scan.inventory");
-    sample().write(&file).expect("write");
+    sample()
+        .write(&file, scrub_store::Replace::Never)
+        .expect("write");
     assert!(Inventory::read(&file).expect("read").is_native());
 }
 
@@ -296,7 +308,9 @@ fn an_analysis_survives_being_written_and_read() {
     let file = directory.path().join("scan.analysis");
 
     let original = analysed();
-    original.write(&file).expect("the analysis must write");
+    original
+        .write(&file, scrub_store::Replace::Never)
+        .expect("the analysis must write");
     let recovered = scrub_store::Analysis::read(&file).expect("the analysis must read back");
 
     assert_eq!(original, recovered);
@@ -310,7 +324,9 @@ fn several_names_for_one_object_survive_as_one_object() {
     let directory = tempfile::tempdir().expect("a temporary directory");
     let file = directory.path().join("scan.analysis");
 
-    analysed().write(&file).expect("write");
+    analysed()
+        .write(&file, scrub_store::Replace::Never)
+        .expect("write");
     let recovered = scrub_store::Analysis::read(&file).expect("read");
 
     let exact = recovered
@@ -337,7 +353,9 @@ fn an_analysis_digests_differently_from_the_inventory_it_came_from() {
 fn an_analysis_edited_after_writing_is_refused() {
     let directory = tempfile::tempdir().expect("a temporary directory");
     let file = directory.path().join("scan.analysis");
-    analysed().write(&file).expect("write");
+    analysed()
+        .write(&file, scrub_store::Replace::Never)
+        .expect("write");
 
     let connection = rusqlite::Connection::open(&file).expect("open for editing");
     connection
@@ -354,5 +372,31 @@ fn an_analysis_edited_after_writing_is_refused() {
             Err(scrub_store::StoreError::ContentAltered { .. })
         ),
         "an altered analysis must be refused"
+    );
+}
+
+#[test]
+fn an_artifact_from_an_older_format_says_so_rather_than_crying_tamper() {
+    // The distinction this guards is about trust, not correctness. An artifact
+    // written before the canonical form changed has a digest that no longer
+    // matches, and the two possible messages could not be further apart: one
+    // says the format moved on, the other says somebody edited your file. Firing
+    // the second on an ordinary upgrade would teach people to ignore it.
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let file = directory.path().join("scan.inventory");
+    sample()
+        .write(&file, scrub_store::Replace::Never)
+        .expect("write");
+
+    let connection = rusqlite::Connection::open(&file).expect("open for editing");
+    connection
+        .execute("UPDATE header SET schema_version = schema_version - 1", [])
+        .expect("age the artifact by one schema version");
+    drop(connection);
+
+    let outcome = Inventory::read(&file);
+    assert!(
+        matches!(outcome, Err(scrub_store::StoreError::WrongSchema { .. })),
+        "an older format is reported as an older format, got {outcome:?}"
     );
 }

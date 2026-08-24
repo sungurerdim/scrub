@@ -73,13 +73,15 @@ impl Inventory {
 
     /// Writes the artifact.
     ///
+    /// Refuses if something is already there. Even the tool's own output is not
+    /// overwritten without being asked (DR-6); `replace` says yes.
+    ///
     /// # Errors
     ///
-    /// Returns [`StoreError`] if the file could not be created or written.
-    pub fn write(&self, path: &Path) -> Result<(), StoreError> {
-        // DR-11-EXEMPT: this is the tool's own artifact, in a location the user
-        // chose for it, and never a path discovered by a scan.
-        let mut connection = Connection::open(path)?;
+    /// Returns [`StoreError::AlreadyThere`] if the path is occupied and
+    /// `replace` is false, or [`StoreError::Sqlite`] if the write failed.
+    pub fn write(&self, path: &Path, replace: Replace) -> Result<(), StoreError> {
+        let mut connection = open_for_writing(path, replace)?;
         schema::create(&connection)?;
         let transaction = connection.transaction()?;
         schema::write_body(&transaction, &self.header, &self.body)?;
@@ -101,6 +103,7 @@ impl Inventory {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
         )?;
         let (header, body) = schema::read_body(&connection)?;
+        check_schema(&header)?;
         let inventory = Self { header, body };
 
         // The header names a digest of the body; if the two disagree, something
@@ -151,13 +154,14 @@ impl Analysis {
 
     /// Writes the artifact.
     ///
+    /// Refuses if something is already there, as [`Inventory::write`] does.
+    ///
     /// # Errors
     ///
-    /// Returns [`StoreError`] if the file could not be created or written.
-    pub fn write(&self, path: &Path) -> Result<(), StoreError> {
-        // DR-11-EXEMPT: the tool's own artifact, in a location the user chose
-        // for it, and never a path discovered by a scan.
-        let mut connection = Connection::open(path)?;
+    /// Returns [`StoreError::AlreadyThere`] if the path is occupied and
+    /// `replace` is false.
+    pub fn write(&self, path: &Path, replace: Replace) -> Result<(), StoreError> {
+        let mut connection = open_for_writing(path, replace)?;
         schema::create(&connection)?;
         schema::create_groups(&connection)?;
         let transaction = connection.transaction()?;
@@ -180,6 +184,7 @@ impl Analysis {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
         )?;
         let (header, body) = schema::read_body(&connection)?;
+        check_schema(&header)?;
         let analysis = Self {
             header,
             body,
@@ -197,12 +202,90 @@ impl Analysis {
     }
 }
 
+/// Whether an artifact may take the place of one already there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Replace {
+    /// Refuse, and say what is in the way.
+    Never,
+    /// Remove what is there first. Only ever from an explicit instruction.
+    Yes,
+}
+
+/// Opens a path for a fresh artifact, refusing to displace one silently.
+fn open_for_writing(path: &Path, replace: Replace) -> Result<Connection, StoreError> {
+    // DR-11-EXEMPT: the tool's own artifact, at a location the user named for
+    // it, and never a path discovered by a scan.
+    if path.exists() {
+        if replace == Replace::Never {
+            return Err(StoreError::AlreadyThere {
+                path: path.to_path_buf(),
+            });
+        }
+        // DR-11-EXEMPT: as above. Removing first rather than writing into an
+        // existing database, which would append a second set of tables to
+        // someone else's file and produce an artifact that is neither.
+        std::fs::remove_file(path).map_err(|source| StoreError::CouldNotReplace {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    }
+    Ok(Connection::open(path)?)
+}
+
+/// Rejects an artifact this build cannot read, before anything else is judged.
+///
+/// Checked ahead of the content digest so that a schema change reports itself as
+/// a schema change. An artifact written before the canonical form changed has a
+/// digest that no longer matches, and saying "somebody edited your file" about an
+/// ordinary version difference would be alarming and wrong.
+fn check_schema(header: &ArtifactHeader) -> Result<(), StoreError> {
+    if header.schema_version == scrub_core::artifact::SCHEMA_VERSION {
+        return Ok(());
+    }
+    Err(StoreError::WrongSchema {
+        expected: scrub_core::artifact::SCHEMA_VERSION,
+        found: header.schema_version,
+    })
+}
+
 /// A failure reading or writing an artifact.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     /// The database refused the operation.
     #[error("artifact storage failed: {0}")]
     Sqlite(#[from] rusqlite::Error),
+
+    /// The artifact was written by a build with a different artifact schema.
+    #[error(
+        "this artifact was written with schema version {found}, and this build \
+         reads version {expected}. It is not damaged — the format changed. \
+         Produce it again with this build."
+    )]
+    WrongSchema {
+        /// What this build reads.
+        expected: u32,
+        /// What the artifact declares.
+        found: u32,
+    },
+
+    /// Something is already at the path the artifact would be written to.
+    #[error(
+        "{path} already exists, and nothing is overwritten without being asked. \
+         Choose another name, or pass --replace to write over it."
+    )]
+    AlreadyThere {
+        /// What is in the way.
+        path: std::path::PathBuf,
+    },
+
+    /// The existing file could not be removed to make room.
+    #[error("could not replace {path}: {source}")]
+    CouldNotReplace {
+        /// What could not be removed.
+        path: std::path::PathBuf,
+        /// Why not.
+        source: std::io::Error,
+    },
 
     /// A value in the artifact could not be understood.
     #[error("artifact field {field} could not be read: {detail}")]

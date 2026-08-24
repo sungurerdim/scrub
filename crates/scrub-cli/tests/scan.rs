@@ -261,3 +261,53 @@ fn an_analysis_reads_back_and_reports_the_same_findings() {
         "the findings survive storage: {text}"
     );
 }
+
+#[test]
+fn an_existing_artifact_is_not_written_over_without_being_asked() {
+    // DR-6 applied to the tool's own output. The refusal also has to come
+    // before the work: being told the name was taken after a two-minute scan is
+    // the same information delivered uselessly late.
+    let tree = fixture();
+    let elsewhere = workspace();
+    let out = elsewhere.path().join("scan.inventory");
+
+    let first = scrub()
+        .args(["scan", "--quiet", "--out"])
+        .arg(&out)
+        .arg(tree.path())
+        .status()
+        .expect("the first scan must run");
+    assert!(first.status_ok());
+
+    let second = scrub()
+        .args(["scan", "--quiet", "--out"])
+        .arg(&out)
+        .arg(tree.path())
+        .output()
+        .expect("the second scan must run");
+    assert!(!second.status.success(), "the second scan must refuse");
+    let complaint = String::from_utf8_lossy(&second.stderr);
+    assert!(
+        complaint.contains("already exists") && complaint.contains("--replace"),
+        "the refusal must say what to do about it: {complaint}"
+    );
+
+    let replaced = scrub()
+        .args(["scan", "--quiet", "--replace", "--out"])
+        .arg(&out)
+        .arg(tree.path())
+        .status()
+        .expect("the replacing scan must run");
+    assert!(replaced.status_ok(), "--replace is taken as the answer");
+}
+
+/// `ExitStatus::success`, named so the assertions above read as sentences.
+trait StatusOk {
+    fn status_ok(&self) -> bool;
+}
+
+impl StatusOk for std::process::ExitStatus {
+    fn status_ok(&self) -> bool {
+        self.success()
+    }
+}

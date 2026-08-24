@@ -102,6 +102,16 @@ Three narrowings, in order:
 Measured on this repository's own tree: 8,274 files shared a size, 1,999 survived
 the sample, so **76% of the candidates were never read past their two ends**.
 
+Measured on a home directory of 2.47 million entries: **697 seconds**, finding
+221,502 proven groups holding 681,143 redundant copies and 30.8 GB that removal
+would actually return, alongside 98 groups left unchecked because their content
+is in the cloud.
+
+That figure settles the question the traversal section left open. Analysis takes
+seven times as long as the walk that feeds it, so it is where parallelism belongs
+and the walk is not. Both numbers are recorded so that a change has something to
+beat.
+
 A sample digest is never identity. Two files can agree at both ends and differ in
 the middle, which is exactly what the third pass is for — and why a file the
 sample separated is recorded as *settled and distinct* rather than as unread.
