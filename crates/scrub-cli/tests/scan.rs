@@ -164,3 +164,100 @@ fn scanning_a_path_that_does_not_exist_reports_it_rather_than_pretending() {
         "the missing path must be reported as unread, got: {text}"
     );
 }
+
+/// A tree holding a real duplicate, a near-miss, and a hard link.
+fn duplicates() -> tempfile::TempDir {
+    let tree = tempfile::tempdir().expect("a temporary directory");
+    let root = tree.path();
+
+    // Same content under two names: the one genuine finding.
+    fs::write(root.join("invoice.pdf"), vec![b'x'; 5_000]).expect("write invoice");
+    fs::write(root.join("invoice-copy.pdf"), vec![b'x'; 5_000]).expect("write copy");
+
+    // Same size, different content: a size collision, not a duplicate.
+    let mut different = vec![b'x'; 5_000];
+    different[2_500] = b'y';
+    fs::write(root.join("statement.pdf"), &different).expect("write statement");
+
+    #[cfg(unix)]
+    fs::hard_link(root.join("invoice.pdf"), root.join("invoice-link.pdf")).expect("hard link");
+
+    tree
+}
+
+fn analyse(tree: &std::path::Path, workspace: &std::path::Path) -> String {
+    let inventory = workspace.join("scan.inventory");
+    let analysis = workspace.join("scan.analysis");
+
+    let status = scrub()
+        .args(["scan", "--quiet", "--out"])
+        .arg(&inventory)
+        .arg(tree)
+        .status()
+        .expect("the scan must run");
+    assert!(status.success());
+
+    let output = scrub()
+        .args(["analyze", "--quiet"])
+        .arg(&inventory)
+        .args(["--out"])
+        .arg(&analysis)
+        .output()
+        .expect("the analysis must run");
+    assert!(
+        output.status.success(),
+        "analyze failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+#[test]
+fn an_analysis_finds_the_duplicate_and_not_the_size_collision() {
+    // Both halves matter. Missing the copy makes the tool useless; reporting the
+    // size collision makes it dangerous.
+    let tree = duplicates();
+    let elsewhere = workspace();
+    let text = analyse(tree.path(), elsewhere.path());
+
+    assert!(
+        text.contains("1 group(s) proven identical"),
+        "exactly one group, and not two: {text}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_hard_link_does_not_inflate_what_an_analysis_promises() {
+    // Three names, two objects, one redundant copy. A tool counting names would
+    // promise twice the space that deleting can return (DR-16).
+    let tree = duplicates();
+    let elsewhere = workspace();
+    let text = analyse(tree.path(), elsewhere.path());
+
+    assert!(
+        text.contains("holding 1 redundant cop"),
+        "one redundant object, not two: {text}"
+    );
+}
+
+#[test]
+fn an_analysis_reads_back_and_reports_the_same_findings() {
+    let tree = duplicates();
+    let elsewhere = workspace();
+    analyse(tree.path(), elsewhere.path());
+
+    let inspected = scrub()
+        .arg("inspect")
+        .arg(elsewhere.path().join("scan.analysis"))
+        .output()
+        .expect("inspect must run");
+    assert!(inspected.status.success());
+
+    let text = String::from_utf8_lossy(&inspected.stdout);
+    assert!(text.contains("Analyze"), "the stage is reported: {text}");
+    assert!(
+        text.contains("1 group(s) proven identical"),
+        "the findings survive storage: {text}"
+    );
+}

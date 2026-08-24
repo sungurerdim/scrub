@@ -8,9 +8,13 @@ use std::io::{IsTerminal as _, Write as _};
 use std::path::Path;
 use std::time::Instant;
 
+use std::collections::HashMap;
+
+use scrub_core::analysis::{Certainty, Settled};
+use scrub_core::artifact::ArtifactHeader;
 use scrub_core::cloud::{CloudMap, LinkVerdict, Residency};
-use scrub_core::inventory::{EntryKind, ScanOutcome, UnreadReason};
-use scrub_store::Inventory;
+use scrub_core::inventory::{Entry, EntryKind, ScanOutcome, UnreadReason};
+use scrub_store::{Analysis, Body};
 
 /// Prints what the machine is synchronising, before the scan starts.
 pub fn describe_providers(map: &CloudMap) {
@@ -110,15 +114,170 @@ impl Progress {
     }
 }
 
+/// Runs the two reading passes, reporting as it goes.
+///
+/// The first reads each candidate's two ends, which separates almost everything
+/// that merely shares a size. Only what survives that is read in full — which is
+/// the difference between reading a terabyte and reading a few gigabytes of it.
+pub fn run_passes(
+    entries: &[Entry],
+    mode: &scrub_platform::ScanMode,
+    quiet: bool,
+) -> HashMap<usize, Settled> {
+    let candidates = scrub_core::analysis::readable_candidates(entries);
+    if !quiet {
+        println!(
+            "{} files share a size with another and can be read here.",
+            candidates.len()
+        );
+    }
+
+    let sampled = read_pass(entries, &candidates, mode, quiet, "sampling ends", true);
+    let coarse = scrub_core::analysis::group_duplicates(entries, &sampled);
+    let confirm = scrub_core::analysis::needing_full_read(&coarse);
+
+    if !quiet {
+        println!(
+            "  {} still matched after sampling and are read in full.",
+            confirm.len()
+        );
+    }
+    let confirmed = read_pass(entries, &confirm, mode, quiet, "reading in full", false);
+
+    // Everything sampled counts as settled. A file the sample separated matched
+    // nothing, which is a finding rather than a gap; filing it as unread would
+    // turn a settled fact into a question (DR-14).
+    let mut settled = HashMap::with_capacity(sampled.len());
+    for index in sampled.keys() {
+        settled.insert(*index, Settled::DistinctBySample);
+    }
+    settled.extend(confirmed);
+    settled
+}
+
+fn read_pass(
+    entries: &[Entry],
+    indices: &[usize],
+    mode: &scrub_platform::ScanMode,
+    quiet: bool,
+    label: &str,
+    sample: bool,
+) -> HashMap<usize, Settled> {
+    let mut digests = HashMap::with_capacity(indices.len());
+    let show = !quiet && std::io::stdout().is_terminal();
+    let mut last_drawn = Instant::now();
+
+    for (done, index) in indices.iter().enumerate() {
+        let entry = &entries[*index];
+        let outcome = if sample {
+            scrub_platform::digest::quick_digest(
+                &entry.path,
+                &entry.cloud,
+                entry.logical_size,
+                mode,
+            )
+        } else {
+            scrub_platform::digest::full_digest(&entry.path, &entry.cloud, entry.logical_size, mode)
+        };
+        // A refusal is not a failure to report loudly here: the file simply
+        // stays unsettled, and the group it belongs to says why.
+        if let Ok(digest) = outcome {
+            digests.insert(*index, Settled::Content(digest));
+        }
+
+        if show && last_drawn.elapsed().as_millis() >= 250 {
+            last_drawn = Instant::now();
+            print!("\r  {label}: {done}/{}    ", indices.len());
+            let _ = std::io::stdout().flush();
+        }
+    }
+
+    if show {
+        print!("\r{}\r", " ".repeat(40));
+        let _ = std::io::stdout().flush();
+    }
+    digests
+}
+
+/// Prints what an analysis concluded.
+pub fn describe_groups(analysis: &Analysis, written_to: Option<&Path>) {
+    let exact: Vec<_> = analysis
+        .groups
+        .iter()
+        .filter(|group| group.certainty == Certainty::Exact)
+        .collect();
+    let candidates: Vec<_> = analysis
+        .groups
+        .iter()
+        .filter(|group| group.certainty == Certainty::Candidate)
+        .collect();
+
+    let reclaimable: u64 = exact.iter().map(|group| group.reclaimable_bytes()).sum();
+    let copies: usize = exact
+        .iter()
+        .map(|group| group.objects.len().saturating_sub(1))
+        .sum();
+
+    println!("\nDuplicates");
+    println!(
+        "  {} group(s) proven identical, holding {copies} redundant cop(ies)",
+        exact.len()
+    );
+    println!(
+        "  {} would be freed by keeping one of each",
+        human_bytes(reclaimable)
+    );
+
+    // Never added to the figure above. What might be recoverable is not
+    // something anyone should plan around (DR-15).
+    if candidates.is_empty() {
+        println!("  nothing was left unchecked");
+    } else {
+        let to_settle: u64 = candidates.iter().map(|group| group.bytes_to_settle()).sum();
+        println!(
+            "\n  {} group(s) could not be checked, because their content is not on",
+            candidates.len()
+        );
+        println!("  this machine. They are not counted above.");
+        if to_settle > 0 {
+            println!("  Settling them would download {}.", human_bytes(to_settle));
+        }
+    }
+
+    if let Some(largest) = exact.iter().max_by_key(|group| group.reclaimable_bytes())
+        && largest.reclaimable_bytes() > 0
+    {
+        println!(
+            "\n  Largest single finding: {}",
+            human_bytes(largest.reclaimable_bytes())
+        );
+        for object in largest.objects.iter().take(3) {
+            if let Some(index) = object.names.first() {
+                println!(
+                    "    {}",
+                    analysis.body.outcome.entries[*index].path.display()
+                );
+            }
+        }
+        if largest.objects.len() > 3 {
+            println!("    … and {} more", largest.objects.len() - 3);
+        }
+    }
+
+    if let Some(path) = written_to {
+        println!("\nWritten to {}", path.display());
+        println!("  content digest {}", analysis.header.content_digest);
+    }
+}
+
 /// Prints where an artifact came from.
-pub fn describe_header(inventory: &Inventory) {
-    let header = &inventory.header;
+pub fn describe_header(header: &ArtifactHeader, native: bool) {
     println!("Artifact");
     println!("  stage        {:?}", header.stage);
     println!("  produced     {}", header.created_at);
     println!("  by           scrub {}", header.tool_version);
     println!("  content      {}", header.content_digest);
-    if !inventory.is_native() {
+    if !native {
         println!("  paths        recorded by a machine that spells paths differently;");
         println!("               readable and comparable here, but not executable against.");
     }
@@ -126,8 +285,8 @@ pub fn describe_header(inventory: &Inventory) {
 }
 
 /// Prints what a scan found.
-pub fn describe_inventory(inventory: &Inventory, written_to: Option<&Path>) {
-    let outcome = &inventory.outcome;
+pub fn describe_body(body: &Body, written_to: Option<&Path>) {
+    let outcome = &body.outcome;
     let files = count(outcome, EntryKind::File);
     let directories = count(outcome, EntryKind::Directory);
     let links = count(outcome, EntryKind::Symlink);
@@ -184,7 +343,6 @@ pub fn describe_inventory(inventory: &Inventory, written_to: Option<&Path>) {
 
     if let Some(path) = written_to {
         println!("\nWritten to {}", path.display());
-        println!("  content digest {}", inventory.header.content_digest);
     }
 }
 

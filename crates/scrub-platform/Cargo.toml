@@ -10,6 +10,7 @@ authors.workspace = true
 
 [dependencies]
 scrub-core = { path = "../scrub-core" }
+blake3.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 

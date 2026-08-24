@@ -17,6 +17,7 @@ pub use scrub_core::cloud::{
     Retention, RootOrigin,
 };
 
+pub mod digest;
 pub mod walk;
 pub mod win_attributes;
 

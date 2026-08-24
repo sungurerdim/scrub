@@ -20,22 +20,35 @@ pub use canonical::{content_digest, scope_digest};
 use std::path::Path;
 
 use rusqlite::Connection;
+use scrub_core::analysis::Group;
 use scrub_core::artifact::{ArtifactHeader, Digest};
 use scrub_core::cloud::Detection;
 use scrub_core::inventory::ScanOutcome;
 use scrub_core::paths::PathEncoding;
 
-/// A complete inventory artifact: what a scan found, and where it came from.
+/// What a scan found, without regard to which artifact carries it.
+///
+/// Shared by every artifact downstream of a scan: an analysis carries the whole
+/// body forward rather than pointing back at an inventory, so each stage reads
+/// exactly one file and a plan can be made on a machine that has neither the
+/// files nor the scan that produced them (DR-17).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Inventory {
-    /// Where this artifact sits in the chain.
-    pub header: ArtifactHeader,
+pub struct Body {
     /// How the producing machine spells paths.
     pub path_encoding: PathEncoding,
     /// The providers found on that machine.
     pub detection: Detection,
     /// Everything the scan saw, and everywhere it could not look.
     pub outcome: ScanOutcome,
+}
+
+/// A complete inventory artifact: what a scan found, and where it came from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Inventory {
+    /// Where this artifact sits in the chain.
+    pub header: ArtifactHeader,
+    /// What the scan found.
+    pub body: Body,
 }
 
 impl Inventory {
@@ -45,7 +58,7 @@ impl Inventory {
     /// computing it.
     #[must_use]
     pub fn content_digest(&self) -> Digest {
-        canonical::content_digest(&self.detection, &self.outcome)
+        canonical::content_digest(&self.body, &[])
     }
 
     /// Whether this artifact's paths can be acted on by this machine.
@@ -55,7 +68,7 @@ impl Inventory {
     /// originals, so nothing may be executed against them here.
     #[must_use]
     pub fn is_native(&self) -> bool {
-        self.path_encoding == scrub_core::paths::LOCAL
+        self.body.is_native()
     }
 
     /// Writes the artifact.
@@ -69,7 +82,7 @@ impl Inventory {
         let mut connection = Connection::open(path)?;
         schema::create(&connection)?;
         let transaction = connection.transaction()?;
-        schema::write_all(&transaction, self)?;
+        schema::write_body(&transaction, &self.header, &self.body)?;
         transaction.commit()?;
         Ok(())
     }
@@ -87,7 +100,8 @@ impl Inventory {
             path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
         )?;
-        let inventory = schema::read_all(&connection)?;
+        let (header, body) = schema::read_body(&connection)?;
+        let inventory = Self { header, body };
 
         // The header names a digest of the body; if the two disagree, something
         // edited the file after it was written. Reporting that is the whole
@@ -100,6 +114,86 @@ impl Inventory {
             });
         }
         Ok(inventory)
+    }
+}
+
+impl Body {
+    /// Whether these paths can be acted on by this machine.
+    #[must_use]
+    pub fn is_native(&self) -> bool {
+        self.path_encoding == scrub_core::paths::LOCAL
+    }
+}
+
+/// An analysis artifact: everything a scan found, plus what is the same as what.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Analysis {
+    /// Where this artifact sits in the chain.
+    pub header: ArtifactHeader,
+    /// What the scan found, carried forward intact.
+    pub body: Body,
+    /// Files found to hold, or possibly hold, the same content.
+    pub groups: Vec<Group>,
+}
+
+impl Analysis {
+    /// The digest of this artifact's content, in canonical form.
+    #[must_use]
+    pub fn content_digest(&self) -> Digest {
+        canonical::content_digest(&self.body, &self.groups)
+    }
+
+    /// Whether this artifact's paths can be acted on by this machine.
+    #[must_use]
+    pub fn is_native(&self) -> bool {
+        self.body.is_native()
+    }
+
+    /// Writes the artifact.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the file could not be created or written.
+    pub fn write(&self, path: &Path) -> Result<(), StoreError> {
+        // DR-11-EXEMPT: the tool's own artifact, in a location the user chose
+        // for it, and never a path discovered by a scan.
+        let mut connection = Connection::open(path)?;
+        schema::create(&connection)?;
+        schema::create_groups(&connection)?;
+        let transaction = connection.transaction()?;
+        schema::write_body(&transaction, &self.header, &self.body)?;
+        schema::write_groups(&transaction, &self.groups)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Reads an analysis.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::ContentAltered`] if the recorded digest does not
+    /// match the content.
+    pub fn read(path: &Path) -> Result<Self, StoreError> {
+        // DR-11-EXEMPT: as above.
+        let connection = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        let (header, body) = schema::read_body(&connection)?;
+        let analysis = Self {
+            header,
+            body,
+            groups: schema::read_groups(&connection)?,
+        };
+
+        let actual = analysis.content_digest();
+        if actual != analysis.header.content_digest {
+            return Err(StoreError::ContentAltered {
+                recorded: analysis.header.content_digest,
+                found: actual,
+            });
+        }
+        Ok(analysis)
     }
 }
 
@@ -173,11 +267,11 @@ pub fn write_ndjson(inventory: &Inventory, out: &mut impl std::io::Write) -> std
         &serde_json::json!({
             "record": "header",
             "header": inventory.header,
-            "path_encoding": inventory.path_encoding,
+            "path_encoding": inventory.body.path_encoding,
         }),
     )?;
 
-    for root in &inventory.detection.roots {
+    for root in &inventory.body.detection.roots {
         line(
             out,
             &serde_json::json!({
@@ -190,7 +284,7 @@ pub fn write_ndjson(inventory: &Inventory, out: &mut impl std::io::Write) -> std
         )?;
     }
 
-    for link in &inventory.detection.links {
+    for link in &inventory.body.detection.links {
         line(
             out,
             &serde_json::json!({
@@ -203,7 +297,7 @@ pub fn write_ndjson(inventory: &Inventory, out: &mut impl std::io::Write) -> std
         )?;
     }
 
-    for entry in &inventory.outcome.entries {
+    for entry in &inventory.body.outcome.entries {
         line(
             out,
             &serde_json::json!({
@@ -222,7 +316,7 @@ pub fn write_ndjson(inventory: &Inventory, out: &mut impl std::io::Write) -> std
         )?;
     }
 
-    for place in &inventory.outcome.unread {
+    for place in &inventory.body.outcome.unread {
         line(
             out,
             &serde_json::json!({

@@ -11,7 +11,7 @@ use scrub_core::cloud::{
 };
 use scrub_core::inventory::{Entry, EntryKind, FileId, ScanOutcome, Unread, UnreadReason};
 use scrub_core::paths;
-use scrub_store::Inventory;
+use scrub_store::{Body, Inventory};
 
 fn header(content_digest: Digest) -> ArtifactHeader {
     ArtifactHeader {
@@ -122,12 +122,14 @@ fn sample() -> Inventory {
         }],
     };
 
-    let digest = scrub_store::content_digest(&detection, &outcome);
-    Inventory {
-        header: header(digest),
+    let body = Body {
         path_encoding: paths::LOCAL,
         detection,
         outcome,
+    };
+    Inventory {
+        header: header(scrub_store::content_digest(&body, &[])),
+        body,
     }
 }
 
@@ -156,10 +158,11 @@ fn a_path_that_is_not_valid_text_comes_back_byte_for_byte() {
     let recovered = Inventory::read(&file).expect("read");
 
     for (before, after) in original
+        .body
         .outcome
         .entries
         .iter()
-        .zip(&recovered.outcome.entries)
+        .zip(&recovered.body.outcome.entries)
     {
         assert_eq!(before.path, after.path, "every path must return unchanged");
     }
@@ -177,6 +180,7 @@ fn an_identity_beyond_the_signed_range_is_preserved() {
     let recovered = Inventory::read(&file).expect("read");
 
     let identity = recovered
+        .body
         .outcome
         .entries
         .iter()
@@ -230,4 +234,125 @@ fn an_artifact_from_this_machine_is_usable_here() {
     let file = directory.path().join("scan.inventory");
     sample().write(&file).expect("write");
     assert!(Inventory::read(&file).expect("read").is_native());
+}
+
+/// The same body, plus what an analysis concluded about it.
+fn analysed() -> scrub_store::Analysis {
+    use scrub_core::analysis::{Certainty, Group, StorageObject, Unsettled};
+
+    let inventory = sample();
+    let groups = vec![
+        Group {
+            certainty: Certainty::Exact,
+            objects: vec![
+                StorageObject {
+                    names: vec![0],
+                    logical_size: 4_000,
+                    allocated_size: Some(4_096),
+                },
+                StorageObject {
+                    names: vec![2, 1],
+                    logical_size: 4_000,
+                    allocated_size: Some(4_096),
+                },
+            ],
+            digest: Some(Digest::of(b"shared content")),
+            logical_size: 4_000,
+            unsettled: Vec::new(),
+            settled_of_same_size: 0,
+        },
+        Group {
+            certainty: Certainty::Candidate,
+            objects: vec![StorageObject {
+                names: vec![1],
+                logical_size: 8_000_000_000,
+                allocated_size: Some(0),
+            }],
+            digest: None,
+            logical_size: 8_000_000_000,
+            unsettled: vec![Unsettled::WouldRequireDownload {
+                bytes: 8_000_000_000,
+            }],
+            settled_of_same_size: 3,
+        },
+    ];
+
+    let body = inventory.body;
+    let mut header = header(scrub_store::content_digest(&body, &groups));
+    header.stage = Stage::Analyze;
+    header.kind = Stage::Analyze.output_kind();
+    header.parents = vec![Digest::of(b"the inventory this came from")];
+
+    scrub_store::Analysis {
+        header,
+        body,
+        groups,
+    }
+}
+
+#[test]
+fn an_analysis_survives_being_written_and_read() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let file = directory.path().join("scan.analysis");
+
+    let original = analysed();
+    original.write(&file).expect("the analysis must write");
+    let recovered = scrub_store::Analysis::read(&file).expect("the analysis must read back");
+
+    assert_eq!(original, recovered);
+}
+
+#[test]
+fn several_names_for_one_object_survive_as_one_object() {
+    // The shape that carries DR-16 through storage. Flattening these into
+    // separate rows on the way back would turn one set of bytes into several and
+    // reinstate the space claim the analysis was careful not to make.
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let file = directory.path().join("scan.analysis");
+
+    analysed().write(&file).expect("write");
+    let recovered = scrub_store::Analysis::read(&file).expect("read");
+
+    let exact = recovered
+        .groups
+        .iter()
+        .find(|group| group.digest.is_some())
+        .expect("the proven group");
+    assert_eq!(exact.objects.len(), 2);
+    assert_eq!(
+        exact.objects[1].names,
+        vec![2, 1],
+        "names keep the order they were recorded in"
+    );
+}
+
+#[test]
+fn an_analysis_digests_differently_from_the_inventory_it_came_from() {
+    // If the two agreed, a chain check could not tell one from the other, and a
+    // plan built from an analysis could be fed an inventory instead.
+    assert_ne!(sample().content_digest(), analysed().content_digest());
+}
+
+#[test]
+fn an_analysis_edited_after_writing_is_refused() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let file = directory.path().join("scan.analysis");
+    analysed().write(&file).expect("write");
+
+    let connection = rusqlite::Connection::open(&file).expect("open for editing");
+    connection
+        .execute(
+            "UPDATE duplicate_group SET logical_size = logical_size + 1",
+            [],
+        )
+        .expect("edit the findings behind the tool's back");
+    drop(connection);
+
+    assert!(
+        matches!(
+            scrub_store::Analysis::read(&file),
+            Err(scrub_store::StoreError::ContentAltered { .. })
+        ),
+        "an altered analysis must be refused"
+    );
 }

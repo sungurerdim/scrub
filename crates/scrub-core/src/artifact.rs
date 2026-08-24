@@ -26,7 +26,11 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// (DR-18). BLAKE3 is used everywhere rather than a provider-supplied checksum:
 /// provider checksums may narrow a set of candidates but never conclude that two
 /// files are the same file.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// Ordered so that collections keyed by content come out the same way every
+/// time. Grouping output that reshuffles between runs cannot be diffed, and
+/// diffing two scans is half of what these artifacts are for.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct Digest([u8; 32]);
 

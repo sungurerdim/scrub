@@ -10,6 +10,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod analysis;
 pub mod artifact;
 pub mod cloud;
 pub mod inventory;

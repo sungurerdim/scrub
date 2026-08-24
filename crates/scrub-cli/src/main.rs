@@ -38,6 +38,17 @@ enum Command {
         #[arg(long)]
         quiet: bool,
     },
+    /// Work out what is the same file as what, reading only what is already here.
+    Analyze {
+        /// The inventory to analyse.
+        inventory: PathBuf,
+        /// Where to write the analysis.
+        #[arg(short, long, default_value = "scan.analysis")]
+        out: PathBuf,
+        /// Do not print progress while reading.
+        #[arg(long)]
+        quiet: bool,
+    },
     /// Summarise an artifact.
     Inspect {
         /// The artifact to read.
@@ -57,6 +68,11 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let outcome = match cli.command {
         Command::Scan { paths, out, quiet } => scan(paths, &out, quiet),
+        Command::Analyze {
+            inventory,
+            out,
+            quiet,
+        } => analyze(&inventory, &out, quiet),
         Command::Inspect { artifact } => inspect(&artifact),
         Command::Export { artifact, out } => export(&artifact, out.as_deref()),
     };
@@ -94,44 +110,116 @@ fn scan(paths: Vec<PathBuf>, out: &std::path::Path, quiet: bool) -> Result<(), S
         outcome.unread.extend(found.unread);
     }
 
-    let detection = scrub_core::cloud::Detection {
-        roots: map.roots().to_vec(),
-        links: map.links().to_vec(),
+    let body = scrub_store::Body {
+        path_encoding: scrub_core::paths::LOCAL,
+        detection: scrub_core::cloud::Detection {
+            roots: map.roots().to_vec(),
+            links: map.links().to_vec(),
+        },
+        outcome,
     };
-    let content_digest = scrub_store::content_digest(&detection, &outcome);
 
     let inventory = Inventory {
-        header: ArtifactHeader {
-            schema_version: SCHEMA_VERSION,
-            tool_version: env!("CARGO_PKG_VERSION").to_owned(),
-            stage: Stage::Scan,
-            kind: Stage::Scan.output_kind(),
-            parents: Vec::new(),
-            machine: MachineScope::Single {
-                machine: machine::identity()?,
-            },
-            created_at: jiff::Timestamp::now(),
-            scope_digest: scrub_store::scope_digest(&roots),
-            content_digest,
-        },
-        path_encoding: scrub_core::paths::LOCAL,
-        detection,
-        outcome,
+        header: header_for(
+            Stage::Scan,
+            Vec::new(),
+            scrub_store::scope_digest(&roots),
+            scrub_store::content_digest(&body, &[]),
+        )?,
+        body,
     };
 
     inventory
         .write(out)
         .map_err(|error| format!("could not write {}: {error}", out.display()))?;
 
-    report::describe_inventory(&inventory, Some(out));
+    report::describe_body(&inventory.body, Some(out));
+    Ok(())
+}
+
+/// Builds the header every artifact this run produces.
+fn header_for(
+    stage: Stage,
+    parents: Vec<scrub_core::artifact::Digest>,
+    scope_digest: scrub_core::artifact::Digest,
+    content_digest: scrub_core::artifact::Digest,
+) -> Result<ArtifactHeader, String> {
+    Ok(ArtifactHeader {
+        schema_version: SCHEMA_VERSION,
+        tool_version: env!("CARGO_PKG_VERSION").to_owned(),
+        stage,
+        kind: stage.output_kind(),
+        parents,
+        machine: MachineScope::Single {
+            machine: machine::identity()?,
+        },
+        created_at: jiff::Timestamp::now(),
+        scope_digest,
+        content_digest,
+    })
+}
+
+fn analyze(
+    inventory_path: &std::path::Path,
+    out: &std::path::Path,
+    quiet: bool,
+) -> Result<(), String> {
+    // Analysis reads file content, so the same guard the scan starts under
+    // applies here with more force (DR-11).
+    let mode = scrub_platform::enter_read_only_scan_mode().map_err(|error| error.to_string())?;
+
+    let inventory = Inventory::read(inventory_path)
+        .map_err(|error| format!("could not read {}: {error}", inventory_path.display()))?;
+    scrub_core::artifact::verify_executable_here(&inventory.header, machine::identity()?)
+        .map_err(|error| error.to_string())?;
+    if !inventory.is_native() {
+        return Err(
+            "this inventory was recorded by a machine that spells paths differently,              so its files cannot be read here"
+                .to_owned(),
+        );
+    }
+
+    let entries = &inventory.body.outcome.entries;
+    let parent = inventory.header.content_digest;
+
+    let settled = report::run_passes(entries, &mode, quiet);
+    let groups = scrub_core::analysis::group_duplicates(entries, &settled);
+
+    let analysis = scrub_store::Analysis {
+        header: header_for(
+            Stage::Analyze,
+            vec![parent],
+            inventory.header.scope_digest,
+            scrub_store::content_digest(&inventory.body, &groups),
+        )?,
+        body: inventory.body,
+        groups,
+    };
+
+    analysis
+        .write(out)
+        .map_err(|error| format!("could not write {}: {error}", out.display()))?;
+
+    report::describe_groups(&analysis, Some(out));
     Ok(())
 }
 
 fn inspect(artifact: &std::path::Path) -> Result<(), String> {
+    // An analysis is an inventory with more in it, so trying that first tells us
+    // which we were handed without asking the caller to say.
+    if let Ok(analysis) = scrub_store::Analysis::read(artifact)
+        && analysis.header.stage == Stage::Analyze
+    {
+        report::describe_header(&analysis.header, analysis.is_native());
+        report::describe_body(&analysis.body, None);
+        report::describe_groups(&analysis, None);
+        return Ok(());
+    }
+
     let inventory = Inventory::read(artifact)
         .map_err(|error| format!("could not read {}: {error}", artifact.display()))?;
-    report::describe_header(&inventory);
-    report::describe_inventory(&inventory, None);
+    report::describe_header(&inventory.header, inventory.is_native());
+    report::describe_body(&inventory.body, None);
     Ok(())
 }
 

@@ -10,10 +10,10 @@ space, and lets you design a complete reorganization before a single file moves.
 It has no delete operation. It cannot overwrite a file. It never downloads a cloud
 file without asking. Every change it makes is reversible in one step.
 
-> **Status: early development.** Stage 1 of 7 is complete: `scrub scan` records a
-> machine into an inventory artifact. Analysis, comparison and planning are next,
-> and nothing writes to your files yet. See [`docs/PIPELINE.md`](docs/PIPELINE.md)
-> for the build order.
+> **Status: early development.** Stages 1 and 2 of 7 are complete: `scrub scan`
+> records a machine, and `scrub analyze` works out what is the same file as what.
+> Cross-device comparison and planning are next, and nothing writes to your files
+> yet. See [`docs/PIPELINE.md`](docs/PIPELINE.md) for the build order.
 
 ---
 
@@ -82,15 +82,26 @@ Full detail: [`docs/PIPELINE.md`](docs/PIPELINE.md).
 ```bash
 cargo build --release -p scrub-cli
 
-./target/release/scrub scan                    # your home directory
-./target/release/scrub scan ~/Documents -o docs.inventory
-./target/release/scrub inspect scan.inventory  # summarise an artifact
-./target/release/scrub export scan.inventory   # newline-delimited JSON
+./target/release/scrub scan                       # your home directory
+./target/release/scrub analyze scan.inventory     # what is the same as what
+./target/release/scrub inspect scan.analysis      # summarise an artifact
+./target/release/scrub export scan.inventory      # newline-delimited JSON
 ```
 
-A scan opens no files and downloads nothing. On macOS it runs under a kernel
-policy that makes an accidental download fail rather than happen, and it says so
-if the system refuses to grant it.
+A scan opens no files at all. An analysis opens only files already on your disk,
+and reads most of them just at both ends — enough to separate almost everything
+that merely shares a size, without reading it through. On macOS both run under a
+kernel policy that makes an accidental download fail rather than happen, and they
+say so if the system refuses to grant it.
+
+Anything held only in the cloud is reported as unchecked, never guessed at, with
+the exact cost of settling it:
+
+```
+4 group(s) could not be checked, because their content is not on
+this machine. They are not counted above.
+Settling them would download 5.4 kB.
+```
 
 The artifact is an ordinary SQLite database, so you never have to take the
 summary's word for anything:

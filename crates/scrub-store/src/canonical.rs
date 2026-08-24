@@ -10,14 +10,23 @@
 //! unchanged tree have to agree (DR-12).
 
 use blake3::Hasher;
+use scrub_core::analysis::Group;
 use scrub_core::artifact::Digest;
-use scrub_core::cloud::{CloudRoot, Detection, ProviderLink};
-use scrub_core::inventory::{Entry, ScanOutcome, Unread};
+use scrub_core::cloud::{CloudRoot, ProviderLink};
+use scrub_core::inventory::{Entry, Unread};
 use scrub_core::paths::StoredPath;
 
-/// The digest of an inventory's body.
+use crate::Body;
+
+/// The digest of an artifact's content.
+///
+/// Covers the scan body and, for an analysis, the groups derived from it. An
+/// inventory passes no groups, so an analysis never digests to the same value as
+/// the inventory it came from even when it found nothing.
 #[must_use]
-pub fn content_digest(detection: &Detection, outcome: &ScanOutcome) -> Digest {
+pub fn content_digest(body: &Body, groups: &[Group]) -> Digest {
+    let detection = &body.detection;
+    let outcome = &body.outcome;
     let mut hasher = Hasher::new();
 
     let mut roots: Vec<&CloudRoot> = detection.roots.iter().collect();
@@ -74,6 +83,26 @@ pub fn content_digest(detection: &Detection, outcome: &ScanOutcome) -> Digest {
     for place in unread {
         field(&mut hasher, &StoredPath::of(&place.path).bytes);
         json(&mut hasher, &place.reason);
+    }
+
+    // Groups are already ordered by size and then by digest, but ordering is
+    // asserted here rather than assumed: a change upstream that reshuffled them
+    // would otherwise change the digest of identical findings.
+    let mut ordered: Vec<&Group> = groups.iter().collect();
+    ordered.sort_by(|left, right| {
+        left.logical_size
+            .cmp(&right.logical_size)
+            .then_with(|| left.digest.cmp(&right.digest))
+            .then_with(|| {
+                left.objects
+                    .first()
+                    .map(|o| o.names.clone())
+                    .cmp(&right.objects.first().map(|o| o.names.clone()))
+            })
+    });
+    section(&mut hasher, b"groups", ordered.len());
+    for group in ordered {
+        json(&mut hasher, group);
     }
 
     Digest::of(hasher.finalize().as_bytes())
@@ -139,8 +168,9 @@ fn json(hasher: &mut Hasher, value: &impl serde::Serialize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use scrub_core::cloud::Detection;
     use scrub_core::cloud::{CloudState, Provider, RootOrigin};
-    use scrub_core::inventory::EntryKind;
+    use scrub_core::inventory::{EntryKind, ScanOutcome};
     use std::path::PathBuf;
 
     fn entry(path: &str, size: u64) -> Entry {
@@ -158,10 +188,18 @@ mod tests {
         }
     }
 
-    fn outcome(entries: Vec<Entry>) -> ScanOutcome {
-        ScanOutcome {
-            entries,
-            unread: Vec::new(),
+    fn outcome(entries: Vec<Entry>) -> Body {
+        body(Detection::default(), entries)
+    }
+
+    fn body(detection: Detection, entries: Vec<Entry>) -> Body {
+        Body {
+            path_encoding: scrub_core::paths::LOCAL,
+            detection,
+            outcome: ScanOutcome {
+                entries,
+                unread: Vec::new(),
+            },
         }
     }
 
@@ -169,10 +207,7 @@ mod tests {
     fn the_same_content_digests_the_same() {
         let one = outcome(vec![entry("/a.txt", 10), entry("/b.txt", 20)]);
         let two = outcome(vec![entry("/a.txt", 10), entry("/b.txt", 20)]);
-        assert_eq!(
-            content_digest(&Detection::default(), &one),
-            content_digest(&Detection::default(), &two)
-        );
+        assert_eq!(content_digest(&one, &[]), content_digest(&two, &[]));
     }
 
     #[test]
@@ -183,8 +218,8 @@ mod tests {
         let forwards = outcome(vec![entry("/a.txt", 10), entry("/b.txt", 20)]);
         let backwards = outcome(vec![entry("/b.txt", 20), entry("/a.txt", 10)]);
         assert_eq!(
-            content_digest(&Detection::default(), &forwards),
-            content_digest(&Detection::default(), &backwards)
+            content_digest(&forwards, &[]),
+            content_digest(&backwards, &[])
         );
     }
 
@@ -192,20 +227,14 @@ mod tests {
     fn a_changed_size_changes_the_digest() {
         let before = outcome(vec![entry("/a.txt", 10)]);
         let after = outcome(vec![entry("/a.txt", 11)]);
-        assert_ne!(
-            content_digest(&Detection::default(), &before),
-            content_digest(&Detection::default(), &after)
-        );
+        assert_ne!(content_digest(&before, &[]), content_digest(&after, &[]));
     }
 
     #[test]
     fn a_removed_file_changes_the_digest() {
         let before = outcome(vec![entry("/a.txt", 10), entry("/b.txt", 20)]);
         let after = outcome(vec![entry("/a.txt", 10)]);
-        assert_ne!(
-            content_digest(&Detection::default(), &before),
-            content_digest(&Detection::default(), &after)
-        );
+        assert_ne!(content_digest(&before, &[]), content_digest(&after, &[]));
     }
 
     #[test]
@@ -214,10 +243,7 @@ mod tests {
         // feed the hasher identical bytes — two different trees with one digest.
         let one = outcome(vec![entry("/ab", 1), entry("/c", 1)]);
         let two = outcome(vec![entry("/a", 1), entry("/bc", 1)]);
-        assert_ne!(
-            content_digest(&Detection::default(), &one),
-            content_digest(&Detection::default(), &two)
-        );
+        assert_ne!(content_digest(&one, &[]), content_digest(&two, &[]));
     }
 
     #[test]
@@ -229,8 +255,8 @@ mod tests {
         let mut empty = entry("/a.txt", 10);
         empty.allocated_size = Some(0);
         assert_ne!(
-            content_digest(&Detection::default(), &outcome(vec![unknown])),
-            content_digest(&Detection::default(), &outcome(vec![empty]))
+            content_digest(&outcome(vec![unknown]), &[]),
+            content_digest(&outcome(vec![empty]), &[])
         );
     }
 
@@ -246,8 +272,8 @@ mod tests {
             links: Vec::new(),
         };
         assert_ne!(
-            content_digest(&detection, &outcome(vec![])),
-            content_digest(&Detection::default(), &outcome(vec![]))
+            content_digest(&body(detection, vec![]), &[]),
+            content_digest(&outcome(vec![]), &[])
         );
     }
 }

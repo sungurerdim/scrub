@@ -13,6 +13,7 @@
 //! the size of a home-directory artifact and bought nothing.
 
 use rusqlite::{Connection, Transaction, params};
+use scrub_core::analysis::{Group, StorageObject};
 use scrub_core::artifact::{ArtifactHeader, ArtifactKind, Digest, MachineScope, Stage};
 use scrub_core::cloud::{CloudRoot, CloudState, Detection, LinkVerdict, Provider, ProviderLink};
 use scrub_core::inventory::{Entry, EntryKind, FileId, ScanOutcome, Unread, UnreadReason};
@@ -20,7 +21,7 @@ use scrub_core::paths::{PathEncoding, StoredPath};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::{Inventory, StoreError};
+use crate::{Body, StoreError};
 
 const SCHEMA: &str = "
 CREATE TABLE header (
@@ -85,9 +86,18 @@ pub fn create(connection: &Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
-/// Writes an entire inventory.
-pub fn write_all(transaction: &Transaction<'_>, inventory: &Inventory) -> Result<(), StoreError> {
-    let header = &inventory.header;
+/// Adds the tables an analysis needs on top of a scan body.
+pub fn create_groups(connection: &Connection) -> Result<(), StoreError> {
+    connection.execute_batch(GROUP_SCHEMA)?;
+    Ok(())
+}
+
+/// Writes a scan body and its header.
+pub fn write_body(
+    transaction: &Transaction<'_>,
+    header: &ArtifactHeader,
+    inventory: &Body,
+) -> Result<(), StoreError> {
     transaction.execute(
         "INSERT INTO header VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
@@ -171,8 +181,8 @@ pub fn write_all(transaction: &Transaction<'_>, inventory: &Inventory) -> Result
     Ok(())
 }
 
-/// Reads an entire inventory.
-pub fn read_all(connection: &Connection) -> Result<Inventory, StoreError> {
+/// Reads a scan body and its header.
+pub fn read_body(connection: &Connection) -> Result<(ArtifactHeader, Body), StoreError> {
     let raw = connection.query_row("SELECT * FROM header", [], |row| {
         Ok(HeaderRow {
             schema_version: row.get(0)?,
@@ -207,18 +217,126 @@ pub fn read_all(connection: &Connection) -> Result<Inventory, StoreError> {
     };
     let path_encoding = from_json::<PathEncoding>("path_encoding", &raw.path_encoding)?;
 
-    Ok(Inventory {
+    Ok((
         header,
-        path_encoding,
-        detection: Detection {
-            roots: read_roots(connection, path_encoding)?,
-            links: read_links(connection, path_encoding)?,
+        Body {
+            path_encoding,
+            detection: Detection {
+                roots: read_roots(connection, path_encoding)?,
+                links: read_links(connection, path_encoding)?,
+            },
+            outcome: ScanOutcome {
+                entries: read_entries(connection, path_encoding)?,
+                unread: read_unread(connection, path_encoding)?,
+            },
         },
-        outcome: ScanOutcome {
-            entries: read_entries(connection, path_encoding)?,
-            unread: read_unread(connection, path_encoding)?,
-        },
-    })
+    ))
+}
+
+/// Writes the duplicate groups an analysis found.
+pub fn write_groups(transaction: &Transaction<'_>, groups: &[Group]) -> Result<(), StoreError> {
+    let mut statement =
+        transaction.prepare("INSERT INTO duplicate_group VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")?;
+    for (position, group) in groups.iter().enumerate() {
+        statement.execute(params![
+            store(position as u64),
+            to_json(&group.certainty),
+            group.digest.map(Digest::to_hex),
+            store(group.logical_size),
+            store(group.reclaimable_bytes()),
+            store(group.settled_of_same_size as u64),
+            to_json(&group.unsettled),
+        ])?;
+    }
+    drop(statement);
+
+    // One row per name, so a duplicate group can be joined straight onto the
+    // entries it refers to in any database browser.
+    let mut statement =
+        transaction.prepare("INSERT INTO group_member VALUES (?1, ?2, ?3, ?4, ?5)")?;
+    for (position, group) in groups.iter().enumerate() {
+        for (object, storage) in group.objects.iter().enumerate() {
+            for name in &storage.names {
+                statement.execute(params![
+                    store(position as u64),
+                    store(object as u64),
+                    store(*name as u64),
+                    store(storage.logical_size),
+                    storage.allocated_size.map(store),
+                ])?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reads the duplicate groups back.
+pub fn read_groups(connection: &Connection) -> Result<Vec<Group>, StoreError> {
+    let mut statement = connection.prepare(
+        "SELECT group_id, certainty, digest, logical_size, settled_of_same_size, unsettled
+         FROM duplicate_group ORDER BY group_id",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut members = connection.prepare(
+        "SELECT group_id, object_id, entry_index, logical_size, allocated_size
+         FROM group_member ORDER BY group_id, object_id, rowid",
+    )?;
+    let member_rows = members
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut groups = Vec::with_capacity(rows.len());
+    for (id, certainty, digest, logical_size, settled, unsettled) in rows {
+        let mut objects: Vec<StorageObject> = Vec::new();
+        for (group_id, object_id, entry_index, size, allocated) in &member_rows {
+            if *group_id != id {
+                continue;
+            }
+            let position = usize::try_from(*object_id).unwrap_or(0);
+            while objects.len() <= position {
+                objects.push(StorageObject {
+                    names: Vec::new(),
+                    logical_size: load(*size),
+                    allocated_size: allocated.map(load),
+                });
+            }
+            objects[position]
+                .names
+                .push(usize::try_from(*entry_index).unwrap_or(0));
+        }
+
+        groups.push(Group {
+            certainty: from_json("duplicate_group.certainty", &certainty)?,
+            objects,
+            digest: digest
+                .map(|text| parse_digest("duplicate_group.digest", &text))
+                .transpose()?,
+            logical_size: load(logical_size),
+            unsettled: from_json("duplicate_group.unsettled", &unsettled)?,
+            settled_of_same_size: usize::try_from(load(settled)).unwrap_or(0),
+        });
+    }
+    Ok(groups)
 }
 
 fn read_roots(
@@ -344,6 +462,28 @@ fn read_unread(
 
     Ok(unread)
 }
+
+const GROUP_SCHEMA: &str = "
+CREATE TABLE duplicate_group (
+    group_id             INTEGER NOT NULL,
+    certainty            TEXT    NOT NULL,
+    digest               TEXT,
+    logical_size         INTEGER NOT NULL,
+    reclaimable_bytes    INTEGER NOT NULL,
+    settled_of_same_size INTEGER NOT NULL,
+    unsettled            TEXT    NOT NULL
+) STRICT;
+
+CREATE TABLE group_member (
+    group_id       INTEGER NOT NULL,
+    object_id      INTEGER NOT NULL,
+    entry_index    INTEGER NOT NULL,
+    logical_size   INTEGER NOT NULL,
+    allocated_size INTEGER
+) STRICT;
+
+CREATE INDEX group_member_by_group ON group_member (group_id);
+";
 
 /// One row of the header table, before it becomes an [`ArtifactHeader`].
 struct HeaderRow {

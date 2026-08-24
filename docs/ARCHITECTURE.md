@@ -84,6 +84,35 @@ What matters more than raw speed at this stage is that results arrive
 progressively: a scan that shows nothing for two minutes is indistinguishable
 from one that has hung.
 
+## Reading content
+
+Identity is decided by a BLAKE3 digest of a file's whole content, and by nothing
+else (DR-13). Getting there cheaply matters, because reading every file to find
+out which ones match would read the disk to learn what sizes already ruled out.
+
+Three narrowings, in order:
+
+1. **Size.** A size no other object shares cannot have a duplicate. Nothing about
+   such a file is ever read.
+2. **Sample.** Candidates get a digest of their first and last 64 KB plus their
+   length. Two large files that merely share a size are separated for a few
+   kilobytes instead of their whole length.
+3. **Full read.** Only what survives the sample is read through.
+
+Measured on this repository's own tree: 8,274 files shared a size, 1,999 survived
+the sample, so **76% of the candidates were never read past their two ends**.
+
+A sample digest is never identity. Two files can agree at both ends and differ in
+the middle, which is exactly what the third pass is for — and why a file the
+sample separated is recorded as *settled and distinct* rather than as unread.
+Confusing those two would file a proven fact under "could not check" and bury the
+handful of real questions among thousands of false ones.
+
+Nothing whose content lives with a provider is read at any stage. Those files
+become candidate-tier findings carrying the exact number of bytes that settling
+them would download, which is a decision left to the person paying for the
+bandwidth.
+
 ## Artifact size
 
 Measured on the same home directory: **2,473,068 entries in a 1.09 GB
