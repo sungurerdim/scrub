@@ -1,0 +1,32 @@
+[package]
+name = "scrub-store"
+description = "Reading and writing scrub's artifacts as SQLite databases"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# This crate exists to keep its one heavyweight dependency in one place.
+# rusqlite bundles SQLite's C source, which needs a C compiler for whichever
+# target is being built. That is fine when building for the machine you are on,
+# and fatal for the Windows cross-check in scripts/check.sh, which is how this
+# project verifies Windows code without a Windows machine. Keeping storage out
+# of scrub-core and scrub-platform means every line of Windows-specific code
+# stays cross-checkable.
+[dependencies]
+scrub-core = { path = "../scrub-core" }
+rusqlite.workspace = true
+blake3.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+jiff.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+rusqlite.workspace = true
+
+[lints]
+workspace = true

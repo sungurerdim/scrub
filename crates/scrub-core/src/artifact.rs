@@ -271,6 +271,14 @@ pub struct ArtifactHeader {
     pub created_at: Timestamp,
     /// Digest of the scan scope configuration in effect.
     pub scope_digest: Digest,
+    /// Digest of this artifact's body, in canonical form.
+    ///
+    /// Taken over the content rather than over the file's bytes, so that two
+    /// scans of an unchanged tree produce the same value on any machine and any
+    /// version of the storage engine (DR-12). Children name this digest as their
+    /// parent, which is what makes the chain check meaningful; it covers the body
+    /// only, since a digest cannot cover the field holding it.
+    pub content_digest: Digest,
 }
 
 /// An input artifact offered to a stage, paired with its own digest.
@@ -470,6 +478,7 @@ mod tests {
             machine,
             created_at: Timestamp::UNIX_EPOCH,
             scope_digest: digest("scope"),
+            content_digest: digest("body"),
         }
     }
 

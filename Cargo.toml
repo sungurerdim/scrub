@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/scrub-core", "crates/scrub-platform"]
+members = ["crates/scrub-core", "crates/scrub-platform", "crates/scrub-store"]
 
 [workspace.package]
 version = "0.0.0"

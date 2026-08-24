@@ -38,9 +38,12 @@ else
   # which is the only part that wants an assembler we do not have.
   #
   # Requires, once:  rustup target add x86_64-pc-windows-msvc aarch64-pc-windows-msvc
+  # scrub-store is excluded: it bundles SQLite's C source, which would need a
+  # Windows C compiler. Nothing Windows-specific lives there — every line that
+  # differs per platform is in scrub-platform, which stays covered.
   for target in x86_64-pc-windows-msvc aarch64-pc-windows-msvc; do
     step "cross-check $target"
-    cargo check --workspace --all-targets --target "$target" \
+    cargo check --workspace --exclude scrub-store --all-targets --target "$target" \
       --features scrub-core/portable-hash
   done
 fi

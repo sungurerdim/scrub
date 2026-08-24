@@ -4,14 +4,26 @@
 
 ```
 crates/
-  scrub-core/       scan · analyze · merge · plan · rule engine       platform-independent, pure
-  scrub-platform/   cloud state, dataless detection, safe traversal   one trait, two implementations
+  scrub-core/       vocabulary · artifact schema · chain integrity · rule engine
+  scrub-platform/   cloud state · dataless detection · traversal      one module per platform
+  scrub-store/      artifacts as SQLite, and the canonical digest
   scrub-engine/     preflight · apply · quarantine · journal · undo   [Phase 2]
   scrub-providers/  read-only Drive and Graph clients, user-owned credentials   [Phase 3]
   scrub-photos/     PhotoKit bridge, macOS only, feature-gated        [Phase 4]
   scrub-cli/        every stage as a command
 apps/desktop/       Tauri shell + web interface
 ```
+
+`scrub-core` holds no I/O at all and depends on nothing heavy. `scrub-platform`
+is the only crate that touches a user's filesystem, and `scrub-store` is the only
+one that carries a C dependency.
+
+That last split is load-bearing rather than tidy-minded. `rusqlite` bundles
+SQLite's C source, which needs a C compiler for whichever target is being built —
+fine for the machine you are on, fatal for the Windows cross-check that stands in
+for CI here. Keeping storage in its own crate means every line of
+Windows-specific code stays in `scrub-platform`, where it can still be
+type-checked for both Windows architectures from a Mac.
 
 `scrub-core` holds no I/O beyond reading and writing artifacts. Given the same
 inventory it produces the same analysis on any machine (DR-12), which is what makes

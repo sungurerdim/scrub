@@ -1,0 +1,235 @@
+//! The canonical form an artifact's digest is taken over.
+//!
+//! Not a serialization format anybody reads: a defined byte stream fed to the
+//! hasher, so that the same content always produces the same digest. Every value
+//! is length-prefixed and tagged, so no two different contents can produce the
+//! same stream by accident — `["ab", "c"]` and `["a", "bc"]` must not collide.
+//!
+//! Collections are sorted before hashing. Traversal order depends on how the
+//! filesystem happens to hand back directory entries, and two scans of an
+//! unchanged tree have to agree (DR-12).
+
+use blake3::Hasher;
+use scrub_core::artifact::Digest;
+use scrub_core::cloud::{CloudRoot, Detection, ProviderLink};
+use scrub_core::inventory::{Entry, ScanOutcome, Unread};
+use scrub_core::paths::StoredPath;
+
+/// The digest of an inventory's body.
+#[must_use]
+pub fn content_digest(detection: &Detection, outcome: &ScanOutcome) -> Digest {
+    let mut hasher = Hasher::new();
+
+    let mut roots: Vec<&CloudRoot> = detection.roots.iter().collect();
+    roots.sort_by(|left, right| left.path.cmp(&right.path));
+    section(&mut hasher, b"roots", roots.len());
+    for root in roots {
+        field(&mut hasher, root.path.as_os_str().as_encoded_bytes());
+        json(&mut hasher, &root.provider);
+        field(
+            &mut hasher,
+            root.account.as_deref().unwrap_or("").as_bytes(),
+        );
+        json(&mut hasher, &root.origin);
+    }
+
+    let mut links: Vec<&ProviderLink> = detection.links.iter().collect();
+    links.sort_by(|left, right| left.link.cmp(&right.link));
+    section(&mut hasher, b"links", links.len());
+    for link in links {
+        field(&mut hasher, link.link.as_os_str().as_encoded_bytes());
+        field(&mut hasher, link.target.as_os_str().as_encoded_bytes());
+        json(&mut hasher, &link.provider);
+        json(&mut hasher, &link.verdict);
+    }
+
+    let mut entries: Vec<&Entry> = outcome.entries.iter().collect();
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    section(&mut hasher, b"entries", entries.len());
+    for entry in entries {
+        field(&mut hasher, &StoredPath::of(&entry.path).bytes);
+        json(&mut hasher, &entry.kind);
+        number(&mut hasher, entry.logical_size);
+        optional_number(&mut hasher, entry.allocated_size);
+        optional_number(
+            &mut hasher,
+            entry.created.map(|when| when.as_second().unsigned_abs()),
+        );
+        optional_number(
+            &mut hasher,
+            entry.modified.map(|when| when.as_second().unsigned_abs()),
+        );
+        json(&mut hasher, &entry.file_id);
+        number(&mut hasher, entry.link_count);
+        match &entry.link_target {
+            Some(target) => field(&mut hasher, &StoredPath::of(target).bytes),
+            None => field(&mut hasher, b""),
+        }
+        json(&mut hasher, &entry.cloud);
+    }
+
+    let mut unread: Vec<&Unread> = outcome.unread.iter().collect();
+    unread.sort_by(|left, right| left.path.cmp(&right.path));
+    section(&mut hasher, b"unread", unread.len());
+    for place in unread {
+        field(&mut hasher, &StoredPath::of(&place.path).bytes);
+        json(&mut hasher, &place.reason);
+    }
+
+    Digest::of(hasher.finalize().as_bytes())
+}
+
+/// Marks the start of a collection and how many items follow.
+fn section(hasher: &mut Hasher, name: &[u8], count: usize) {
+    field(hasher, name);
+    number(hasher, count as u64);
+}
+
+/// Feeds one value, prefixed by its length so it cannot run into the next.
+fn field(hasher: &mut Hasher, bytes: &[u8]) {
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
+
+fn number(hasher: &mut Hasher, value: u64) {
+    hasher.update(&value.to_le_bytes());
+}
+
+/// Distinguishes "absent" from "zero", which are different facts.
+fn optional_number(hasher: &mut Hasher, value: Option<u64>) {
+    match value {
+        Some(value) => {
+            hasher.update(&[1]);
+            number(hasher, value);
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
+}
+
+/// Feeds a value through its serialized form.
+///
+/// Serde emits a struct's fields in declaration order, so this is stable for a
+/// given schema version; a schema change that reorders fields changes the
+/// digest, which is correct — it is a different artifact shape.
+fn json(hasher: &mut Hasher, value: &impl serde::Serialize) {
+    let encoded = serde_json::to_vec(value).unwrap_or_else(|_| b"null".to_vec());
+    field(hasher, &encoded);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scrub_core::cloud::{CloudState, Provider, RootOrigin};
+    use scrub_core::inventory::EntryKind;
+    use std::path::PathBuf;
+
+    fn entry(path: &str, size: u64) -> Entry {
+        Entry {
+            path: PathBuf::from(path),
+            kind: EntryKind::File,
+            logical_size: size,
+            allocated_size: Some(4_096),
+            created: None,
+            modified: None,
+            file_id: None,
+            link_count: 1,
+            link_target: None,
+            cloud: CloudState::not_synced(),
+        }
+    }
+
+    fn outcome(entries: Vec<Entry>) -> ScanOutcome {
+        ScanOutcome {
+            entries,
+            unread: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_same_content_digests_the_same() {
+        let one = outcome(vec![entry("/a.txt", 10), entry("/b.txt", 20)]);
+        let two = outcome(vec![entry("/a.txt", 10), entry("/b.txt", 20)]);
+        assert_eq!(
+            content_digest(&Detection::default(), &one),
+            content_digest(&Detection::default(), &two)
+        );
+    }
+
+    #[test]
+    fn traversal_order_does_not_change_the_digest() {
+        // Directory enumeration order is the filesystem's business and varies
+        // between runs. If it changed the digest, "nothing has changed since
+        // last time" could never be stated.
+        let forwards = outcome(vec![entry("/a.txt", 10), entry("/b.txt", 20)]);
+        let backwards = outcome(vec![entry("/b.txt", 20), entry("/a.txt", 10)]);
+        assert_eq!(
+            content_digest(&Detection::default(), &forwards),
+            content_digest(&Detection::default(), &backwards)
+        );
+    }
+
+    #[test]
+    fn a_changed_size_changes_the_digest() {
+        let before = outcome(vec![entry("/a.txt", 10)]);
+        let after = outcome(vec![entry("/a.txt", 11)]);
+        assert_ne!(
+            content_digest(&Detection::default(), &before),
+            content_digest(&Detection::default(), &after)
+        );
+    }
+
+    #[test]
+    fn a_removed_file_changes_the_digest() {
+        let before = outcome(vec![entry("/a.txt", 10), entry("/b.txt", 20)]);
+        let after = outcome(vec![entry("/a.txt", 10)]);
+        assert_ne!(
+            content_digest(&Detection::default(), &before),
+            content_digest(&Detection::default(), &after)
+        );
+    }
+
+    #[test]
+    fn adjacent_fields_cannot_be_confused_for_one_another() {
+        // Without length prefixes, "ab" followed by "c" and "a" followed by "bc"
+        // feed the hasher identical bytes — two different trees with one digest.
+        let one = outcome(vec![entry("/ab", 1), entry("/c", 1)]);
+        let two = outcome(vec![entry("/a", 1), entry("/bc", 1)]);
+        assert_ne!(
+            content_digest(&Detection::default(), &one),
+            content_digest(&Detection::default(), &two)
+        );
+    }
+
+    #[test]
+    fn an_absent_value_differs_from_a_zero_one() {
+        // "the platform could not tell us" and "it occupies nothing" are
+        // different facts, and DR-16 turns on the difference.
+        let mut unknown = entry("/a.txt", 10);
+        unknown.allocated_size = None;
+        let mut empty = entry("/a.txt", 10);
+        empty.allocated_size = Some(0);
+        assert_ne!(
+            content_digest(&Detection::default(), &outcome(vec![unknown])),
+            content_digest(&Detection::default(), &outcome(vec![empty]))
+        );
+    }
+
+    #[test]
+    fn the_providers_found_are_part_of_the_digest() {
+        let detection = Detection {
+            roots: vec![CloudRoot {
+                path: PathBuf::from("/cloud"),
+                provider: Provider::ICloud,
+                account: None,
+                origin: RootOrigin::ProviderMount,
+            }],
+            links: Vec::new(),
+        };
+        assert_ne!(
+            content_digest(&detection, &outcome(vec![])),
+            content_digest(&Detection::default(), &outcome(vec![]))
+        );
+    }
+}
