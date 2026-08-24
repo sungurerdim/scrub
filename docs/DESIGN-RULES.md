@@ -157,6 +157,26 @@ number the user cannot verify.
 
 ---
 
+### DR-22 — Symbolic links are recorded, never followed
+
+Whether a file is backed up is decided by where it physically lives, never by
+whether some path can reach it. Traversal does not follow symbolic links, and a
+file is attributed to a provider only when its own path lies inside that
+provider's directory.
+
+This rule was written after observing both of its failure modes on one machine.
+A user's iCloud Drive contained links pointing outward to a Desktop and Documents
+that were *not* synchronized; following them would have reported those folders as
+backed up when losing them would have lost them for good. The same machine's
+Google Drive reached its main folder through a link pointing outward; refusing to
+look would have silently omitted the entire drive from the inventory.
+
+The two are indistinguishable from the filesystem, so the tool does not guess. A
+link at the top of a provider directory whose target lies outside every known
+provider directory is recorded as an **unresolved link** and put to the user:
+this is here, it points there, does it belong to this provider? Until answered,
+its target is neither scanned as cloud content nor silently dropped.
+
 ## D. Pipeline
 
 The tool is a chain of independent stages connected by durable artifacts. This is

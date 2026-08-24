@@ -1,0 +1,20 @@
+[package]
+name = "scrub-platform"
+description = "Cloud-state detection and side-effect-free filesystem access for scrub"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+
+# No platform binding crates. The two calls we need are declared directly, which
+# is a smaller surface than pulling in libc or windows-sys for three constants
+# and one function.
+
+[lints]
+workspace = true

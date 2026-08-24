@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/scrub-core"]
+members = ["crates/scrub-core", "crates/scrub-platform"]
 
 [workspace.package]
 version = "0.0.0"
@@ -28,6 +28,10 @@ missing_docs = "warn"
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
+# The documentation names products — iCloud, OneDrive, PhotoKit, BLAKE3 — far
+# more often than it names code. This lint reads every such word as a missing
+# code span, and obeying it would put backticks around brand names.
+doc_markdown = "allow"
 
 [profile.release]
 lto = "thin"

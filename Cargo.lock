@@ -294,6 +294,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "scrub-platform"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "thiserror",
+]
+
+[[package]]
 name = "serde"
 version = "1.0.229"
 source = "registry+https://github.com/rust-lang/crates.io-index"

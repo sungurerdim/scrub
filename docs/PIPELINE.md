@@ -90,7 +90,16 @@ pinned to the device.
 
 Also recorded, once per run: the sync topology. Which directories are synchronized
 to which provider, including redirected home directories, application containers,
-and any directory that turns out to be synchronized to nothing at all.
+provider trash areas, and any directory that turns out to be synchronized to
+nothing at all.
+
+Alongside it, the **unresolved links** (DR-22): symbolic links leading out of a
+provider directory to somewhere outside every provider directory. These are
+recorded rather than resolved, because the same shape means opposite things — a
+link out of iCloud Drive to an unsynchronized Desktop, and a link out of a Google
+Drive mount to that drive's main folder, look identical from the filesystem. Each
+one becomes a question the interface puts to the user before anything downstream
+treats its target as backed up or as missing.
 
 **Cost:** minutes on a large tree. **Risk:** none. No file is opened.
 
