@@ -9,6 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use scrub_core::artifact::{Digest, MachineId, MachineScope, Stage};
+use scrub_core::edit::{Arrangement, Edit};
 use scrub_core::merge::Merged;
 use scrub_core::plan::Keep;
 use scrub_core::preflight::Rigour;
@@ -18,12 +19,23 @@ use crate::{RunError, could_not_read, executable_here, header_for, pending};
 
 /// Decides what should happen, without anything happening.
 ///
+/// Two things become operations: the rule for which copy of a duplicate to
+/// keep, and whatever somebody rearranged by hand. They are kept apart until
+/// here on purpose — a person who changes the rule should not lose the folder
+/// they made, and a person who takes back a move should not have every
+/// duplicate re-decided.
+///
 /// # Errors
 ///
 /// Returns a message if the analysis could not be read, or if it is a
 /// comparison of several machines — which describes no single machine, and so
 /// cannot be carried out on one (DR-18).
-pub fn plan(analysis_path: &Path, keep: &Keep, machine: MachineId) -> Result<Plan, RunError> {
+pub fn plan(
+    analysis_path: &Path,
+    keep: &Keep,
+    edits: &[Edit],
+    machine: MachineId,
+) -> Result<Plan, RunError> {
     let analysis =
         Analysis::read(analysis_path).map_err(|error| could_not_read(analysis_path, error))?;
 
@@ -34,11 +46,22 @@ pub fn plan(analysis_path: &Path, keep: &Keep, machine: MachineId) -> Result<Pla
         ));
     }
 
-    let operations = scrub_core::plan::ordered(scrub_core::plan::resolve_duplicates(
+    // Scoped so the arrangement, which borrows the entries, is finished with
+    // before the body is handed to the artifact.
+    let (requested, asked) = {
+        let arrangement = Arrangement::replaying(&analysis.body.outcome.entries, edits);
+        (
+            arrangement.operations(&analysis.settled),
+            arrangement.asked().to_vec(),
+        )
+    };
+
+    let by_rule = scrub_core::plan::resolve_duplicates(
         &analysis.body.outcome.entries,
         &analysis.groups,
         keep,
-    ));
+    );
+    let operations = scrub_core::plan::ordered(scrub_core::plan::combine(by_rule, requested));
 
     let parent = analysis.header.content_digest;
     let mut drafted = Plan {
@@ -51,6 +74,7 @@ pub fn plan(analysis_path: &Path, keep: &Keep, machine: MachineId) -> Result<Pla
         ),
         body: analysis.body,
         operations,
+        edits: asked,
     };
     // Carried across rather than rebuilt: the plan is about the machine the
     // analysis described, whichever machine happens to be drafting it.

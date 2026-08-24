@@ -110,6 +110,51 @@ export interface Outcome {
  */
 export type Runner = <T>(work: () => Promise<T>, then: (result: T) => void) => void;
 
+export interface Item {
+  entry: number;
+  name: string;
+  path: string;
+  isFolder: boolean;
+  size: number;
+  modified: number | null;
+  local: boolean;
+  moved: boolean;
+}
+
+export interface Listing {
+  here: string;
+  parent: string | null;
+  total: number;
+  items: Item[];
+}
+
+export interface Difference {
+  entry: number;
+  was: string;
+  becomes: string | null;
+  carried: boolean;
+}
+
+export interface Arranged {
+  asked: number;
+  differences: number;
+  newFolders: number;
+  setAside: number;
+}
+
+/**
+ * One change, shaped the way the Rust side names them.
+ *
+ * Snake case rather than camel, unlike everything else here: this type crosses
+ * as an enum whose variant names serde spells that way, and the names have to
+ * match exactly or the change is refused as unrecognisable.
+ */
+export type Edit =
+  | { new_directory: { path: string } }
+  | { rename: { entry: number; to: string } }
+  | { relocate: { entry: number; into: string } }
+  | { set_aside: { entry: number } };
+
 export type Phase = "walking" | "sampling" | "reading" | "operating";
 
 export interface Report {
@@ -126,6 +171,13 @@ export const analyze = (thorough: boolean) => invoke<Findings>("analyze", { thor
 export const groups = (offset: number, limit: number) =>
   invoke<GroupRow[]>("groups", { offset, limit });
 export const copies = (group: number) => invoke<Copy[]>("copies", { group });
+export const browse = (under: string | null, offset: number, limit: number) =>
+  invoke<Listing>("browse", { under, offset, limit });
+export const arrange = (edit: Edit) => invoke<Arranged>("arrange", { edit });
+export const takeBack = () => invoke<Arranged>("take_back");
+export const differences = (offset: number, limit: number) =>
+  invoke<Difference[]>("differences", { offset, limit });
+
 export const plan = (keep: string, prefer: string | null) =>
   invoke<Step[]>("plan", { keep, prefer });
 export const preflight = (fast: boolean) => invoke<Step[]>("preflight", { fast });

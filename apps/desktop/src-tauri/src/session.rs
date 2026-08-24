@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use scrub_core::artifact::MachineId;
+use scrub_core::edit::Edit;
+use scrub_core::inventory::Entry;
 use scrub_run::RunError;
 
 /// The current state of one person's way through the pipeline.
@@ -24,6 +26,16 @@ pub struct Session {
     workspace: PathBuf,
     /// This machine's identity, read once.
     machine: Option<MachineId>,
+    /// What the scan found, held while somebody is rearranging it.
+    ///
+    /// Kept in memory rather than read per change, and that is a deliberate
+    /// trade. A real machine's inventory is about a gigabyte; reading it again
+    /// for every folder somebody renames would make rearranging unusable, and
+    /// rearranging is the part of this tool a person spends time in. It is
+    /// dropped when a new scan replaces it.
+    entries: Vec<Entry>,
+    /// The changes somebody has made, in the order they made them.
+    edits: Vec<Edit>,
 }
 
 /// The session, shared with every command.
@@ -66,7 +78,45 @@ impl Session {
         Ok(Self {
             workspace,
             machine: Some(scrub_run::machine::identity()?),
+            entries: Vec::new(),
+            edits: Vec::new(),
         })
+    }
+
+    /// Holds entries describing the same scan, keeping any arrangement.
+    ///
+    /// An analysis carries the scan's entries forward unchanged, so a change
+    /// that named entry 41 still names the same thing. Clearing the arrangement
+    /// here would throw away somebody's work for looking at duplicates.
+    pub fn hold(&mut self, entries: Vec<Entry>) {
+        self.entries = entries;
+    }
+
+    /// Holds what a fresh scan found, and forgets what was arranged.
+    ///
+    /// A new scan describes a different machine-moment, and a change that named
+    /// entry 41 in the old one names something else in the new one. Keeping
+    /// them would be worse than losing them (DR-18).
+    pub fn restart_with(&mut self, entries: Vec<Entry>) {
+        self.entries = entries;
+        self.edits.clear();
+    }
+
+    /// What the scan found, if it is still held.
+    #[must_use]
+    pub fn entries(&self) -> &[Entry] {
+        &self.entries
+    }
+
+    /// The changes somebody has made.
+    #[must_use]
+    pub fn edits(&self) -> &[Edit] {
+        &self.edits
+    }
+
+    /// Replaces the list of changes, after one has been added or taken back.
+    pub fn remember(&mut self, edits: Vec<Edit>) {
+        self.edits = edits;
     }
 
     /// Where artifacts are written.

@@ -252,6 +252,52 @@ pub fn resolve_duplicates(entries: &[Entry], groups: &[Group], keep: &Keep) -> V
     operations
 }
 
+/// Puts a rule's operations together with the ones somebody asked for.
+///
+/// What was asked for wins. A file somebody moved by hand is not also a
+/// redundant copy to be set aside: two operations on one file would have the
+/// second look for it at a path it had already left, and of the two, the one a
+/// person chose is the one they meant.
+///
+/// No file ends up with two operations either way. That is not tidiness — the
+/// executor checks each subject is still where the plan says before touching
+/// it, so a second operation on the same file is a step that skips itself and a
+/// line in the report that means nothing.
+#[must_use]
+pub fn combine(by_rule: Vec<Operation>, requested: Vec<Operation>) -> Vec<Operation> {
+    let asked_about: HashSet<usize> = requested
+        .iter()
+        .filter_map(|operation| operation.subject().map(|subject| subject.entry))
+        .collect();
+
+    let mut combined = requested;
+    let mut folders: HashSet<PathBuf> = combined
+        .iter()
+        .filter_map(|operation| match operation {
+            Operation::CreateDirectory { path } => Some(path.clone()),
+            Operation::Move { .. } | Operation::Quarantine { .. } => None,
+        })
+        .collect();
+
+    for operation in by_rule {
+        match &operation {
+            Operation::CreateDirectory { path } => {
+                if !folders.insert(path.clone()) {
+                    continue;
+                }
+            }
+            Operation::Move { subject, .. } | Operation::Quarantine { subject, .. } => {
+                if asked_about.contains(&subject.entry) {
+                    continue;
+                }
+            }
+        }
+        combined.push(operation);
+    }
+
+    combined
+}
+
 /// Two things wanting the same place, or one place already taken.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Conflict {

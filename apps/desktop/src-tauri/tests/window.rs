@@ -178,6 +178,122 @@ fn the_window_can_walk_the_whole_pipeline_without_touching_anything_else() {
 }
 
 #[test]
+fn everything_can_be_rearranged_with_nothing_happening() {
+    let tree = tempfile::tempdir().expect("a directory to scan");
+    let place = tempfile::tempdir().expect("a directory for artifacts");
+
+    let root = tree.path();
+    std::fs::create_dir(root.join("Belgeler")).expect("mkdir");
+    std::fs::write(root.join("Belgeler/vergi.pdf"), b"a tax return").expect("write");
+    std::fs::write(root.join("loose.txt"), b"filed nowhere in particular").expect("write");
+
+    let app = application(place.path());
+    ask(&app, "begin", json!({})).expect("the first screen");
+    ask(&app, "scan", json!({ "roots": [root.to_string_lossy()] })).expect("a scan");
+
+    // Walking into the tree shows what is there, under the names it has.
+    let listing = ask(
+        &app,
+        "browse",
+        json!({ "under": root.to_string_lossy(), "offset": 0, "limit": 50 }),
+    )
+    .expect("a listing");
+    let names: Vec<&str> = listing["items"]
+        .as_array()
+        .expect("an array")
+        .iter()
+        .map(|item| item["name"].as_str().expect("a name"))
+        .collect();
+    assert_eq!(
+        names,
+        vec!["Belgeler", "loose.txt"],
+        "folders first, then by name"
+    );
+
+    let folder = listing["items"][0]["entry"].as_u64().expect("an entry");
+    let loose = listing["items"][1]["entry"].as_u64().expect("an entry");
+
+    // Rename the folder, then move a file into it by the name it does not have
+    // on disk yet. This is the whole point of the arrangement: the second change
+    // is asked about the world the first one left.
+    ask(
+        &app,
+        "arrange",
+        json!({ "edit": { "rename": { "entry": folder, "to": "Vergi" } } }),
+    )
+    .expect("renaming a folder");
+
+    let arranged = ask(
+        &app,
+        "arrange",
+        json!({ "edit": { "relocate": {
+            "entry": loose,
+            "into": root.join("Vergi").to_string_lossy(),
+        } } }),
+    )
+    .expect("moving a file into the renamed folder");
+    assert_eq!(arranged["asked"], 2);
+    assert_eq!(
+        arranged["differences"], 3,
+        "the folder, the file inside it that came along, and the file moved in"
+    );
+
+    let differences = ask(&app, "differences", json!({ "offset": 0, "limit": 50 }))
+        .expect("the before and after");
+    let differences = differences.as_array().expect("an array");
+    let carried = differences
+        .iter()
+        .filter(|line| line["carried"] == json!(true))
+        .count();
+    assert_eq!(carried, 1, "one thing came along without being asked for");
+
+    // A change that cannot be made is refused in words, and does not count.
+    let refusal = ask(
+        &app,
+        "arrange",
+        json!({ "edit": { "rename": { "entry": loose, "to": "../escape.txt" } } }),
+    )
+    .expect_err("that is a path, not a name");
+    assert!(
+        refusal.as_str().expect("a message").contains("separator"),
+        "the refusal says what was wrong: {refusal}"
+    );
+
+    // Taking one back leaves exactly what was there before it.
+    let after_taking_back = ask(&app, "take_back", json!({})).expect("taking one back");
+    assert_eq!(after_taking_back["asked"], 1);
+    assert_eq!(after_taking_back["differences"], 2);
+
+    // The plan carries what was asked for, alongside anything a rule decided.
+    ask(&app, "analyze", json!({ "thorough": false })).expect("an analysis");
+    ask(
+        &app,
+        "arrange",
+        json!({ "edit": { "new_directory": {
+            "path": root.join("Arsiv").to_string_lossy(),
+        } } }),
+    )
+    .expect("a folder that is not there yet");
+
+    let steps = ask(&app, "plan", json!({ "keep": "oldest", "prefer": null })).expect("a plan");
+    let steps = steps.as_array().expect("an array");
+    let kinds: Vec<&str> = steps
+        .iter()
+        .map(|step| step["kind"].as_str().expect("a kind"))
+        .collect();
+    assert!(
+        kinds.contains(&"createDirectory") && kinds.contains(&"move"),
+        "the plan holds both the folder and the rename: {kinds:?}"
+    );
+
+    // And after all of it, the disk is exactly as it was.
+    assert!(root.join("Belgeler/vergi.pdf").exists(), "nothing moved");
+    assert!(root.join("loose.txt").exists());
+    assert!(!root.join("Vergi").exists(), "and nothing was created");
+    assert!(!root.join("Arsiv").exists());
+}
+
+#[test]
 fn a_stage_asked_for_out_of_order_says_which_step_to_take() {
     let place = tempfile::tempdir().expect("a directory for artifacts");
     let app = application(place.path());

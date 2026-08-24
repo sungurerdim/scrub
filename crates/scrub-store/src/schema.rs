@@ -16,6 +16,7 @@ use rusqlite::{Connection, Transaction, params};
 use scrub_core::analysis::{Group, Settled, StorageObject};
 use scrub_core::artifact::{ArtifactHeader, ArtifactKind, Digest, MachineScope, Stage};
 use scrub_core::cloud::{CloudRoot, CloudState, Detection, LinkVerdict, Provider, ProviderLink};
+use scrub_core::edit::Edit;
 use scrub_core::inventory::{Entry, EntryKind, FileId, ScanOutcome, Unread, UnreadReason};
 use scrub_core::journal::Step;
 use scrub_core::paths::{PathEncoding, StoredPath};
@@ -316,6 +317,38 @@ pub fn read_operations(connection: &Connection) -> Result<Vec<Operation>, StoreE
 
     rows.iter()
         .map(|detail| from_json::<Operation>("operation.detail", detail))
+        .collect()
+}
+
+/// Writes the changes somebody asked for, in the order they asked.
+///
+/// Kept alongside the operations they came to rather than instead of them. The
+/// operations are what gets carried out; these are what a person recognises as
+/// the thing they did, which is what an interface has to show when they come
+/// back tomorrow and want to take one of them back.
+pub fn write_edits(transaction: &Transaction<'_>, edits: &[Edit]) -> Result<(), StoreError> {
+    let mut statement = transaction.prepare("INSERT INTO edit VALUES (?1, ?2, ?3)")?;
+    for (position, edit) in edits.iter().enumerate() {
+        let kind = match edit {
+            Edit::NewDirectory { .. } => "new_directory",
+            Edit::Rename { .. } => "rename",
+            Edit::Relocate { .. } => "relocate",
+            Edit::SetAside { .. } => "set_aside",
+        };
+        statement.execute(params![store(position as u64), kind, to_json(edit)])?;
+    }
+    Ok(())
+}
+
+/// Reads them back in the order they were asked for.
+pub fn read_edits(connection: &Connection) -> Result<Vec<Edit>, StoreError> {
+    let mut statement = connection.prepare("SELECT detail FROM edit ORDER BY position")?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    rows.iter()
+        .map(|detail| from_json::<Edit>("edit.detail", detail))
         .collect()
 }
 
@@ -682,6 +715,12 @@ CREATE TABLE operation (
     destination    TEXT,
     frees_bytes    INTEGER NOT NULL,
     detail         TEXT    NOT NULL
+) STRICT;
+
+CREATE TABLE edit (
+    position   INTEGER NOT NULL PRIMARY KEY,
+    kind       TEXT    NOT NULL,
+    detail     TEXT    NOT NULL
 ) STRICT;
 
 CREATE TABLE verdict (

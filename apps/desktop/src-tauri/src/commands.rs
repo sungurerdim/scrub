@@ -17,6 +17,7 @@
 
 use std::path::{Path, PathBuf};
 
+use scrub_core::edit::{Arrangement, Edit};
 use scrub_core::plan::{Because, Keep, Operation};
 use scrub_core::preflight::{Grade, Impediment, Rigour};
 use scrub_run::{Depth, RunError};
@@ -137,7 +138,237 @@ pub fn scan<R: Runtime>(
         &[session::ANALYSIS, session::PLAN, session::PREFLIGHT],
     );
 
-    Ok(view::Inventory::of(&inventory.body.outcome))
+    let summary = view::Inventory::of(&inventory.body.outcome);
+    state
+        .0
+        .lock()
+        .map_err(|_| poisoned())?
+        .restart_with(inventory.body.outcome.entries);
+    Ok(summary)
+}
+
+/// What is directly inside one folder.
+///
+/// The tree is browsed a folder at a time rather than sent across whole: an
+/// inventory of two and a half million entries is a gigabyte, and a window does
+/// not need a gigabyte to show one folder. Paths reflect the changes made so
+/// far, so somebody navigating after a rename sees the new name (DR-9).
+///
+/// # Errors
+///
+/// Returns a message if nothing has been scanned in this session yet.
+#[tauri::command]
+pub fn browse(
+    state: State<'_, Shared>,
+    under: Option<String>,
+    offset: usize,
+    limit: usize,
+) -> Answer<Listing> {
+    let session = state.0.lock().map_err(|_| poisoned())?;
+    let entries = held(&session)?;
+    let arrangement = Arrangement::replaying(entries, session.edits());
+
+    let root = under.map_or_else(
+        || plainly(scrub_run::home_directory()),
+        |path| Ok(PathBuf::from(path)),
+    )?;
+
+    let mut items: Vec<view::Item> = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let Some(now) = arrangement.path_of(index) else {
+            continue;
+        };
+        if now.parent() != Some(root.as_path()) {
+            continue;
+        }
+        items.push(view::Item {
+            entry: index,
+            name: now
+                .file_name()
+                .map_or_else(String::new, |name| name.to_string_lossy().into_owned()),
+            path: view::show(now),
+            is_folder: entry.kind == scrub_core::inventory::EntryKind::Directory,
+            size: entry.logical_size,
+            modified: entry.modified.map(jiff::Timestamp::as_second),
+            local: !entry.cloud.residency.read_may_download(),
+            moved: now != entry.path,
+        });
+    }
+
+    // Folders first and then by name, which is how every file browser does it
+    // and therefore how somebody expects to find things.
+    items.sort_by(|left, right| {
+        right
+            .is_folder
+            .cmp(&left.is_folder)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+
+    // Folders these changes will create do not exist in the scan, so they are
+    // added here — otherwise somebody makes a folder and cannot see it.
+    let mut made: Vec<view::Item> = arrangement
+        .new_directories()
+        .into_iter()
+        .filter(|path| path.parent() == Some(root.as_path()))
+        .map(|path| view::Item {
+            entry: usize::MAX,
+            name: path
+                .file_name()
+                .map_or_else(String::new, |name| name.to_string_lossy().into_owned()),
+            path: view::show(&path),
+            is_folder: true,
+            size: 0,
+            modified: None,
+            local: true,
+            moved: true,
+        })
+        .collect();
+    made.sort_by(|left, right| left.name.cmp(&right.name));
+    made.extend(items);
+
+    let total = made.len();
+    Ok(Listing {
+        here: view::show(&root),
+        parent: root.parent().map(view::show),
+        total,
+        items: made.into_iter().skip(offset).take(limit).collect(),
+    })
+}
+
+/// One folder's worth of the tree.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Listing {
+    /// The folder being looked at.
+    pub here: String,
+    /// The folder above it, where there is one.
+    pub parent: Option<String>,
+    /// How many things are in it altogether.
+    pub total: usize,
+    /// The slice asked for.
+    pub items: Vec<view::Item>,
+}
+
+/// Makes one change, without anything happening.
+///
+/// # Errors
+///
+/// Returns the reason the change could not be made, in words meant to be shown
+/// as they are.
+#[tauri::command]
+pub fn arrange(state: State<'_, Shared>, edit: Edit) -> Answer<Arranged> {
+    let mut session = state.0.lock().map_err(|_| poisoned())?;
+    let mut edits = session.edits().to_vec();
+    edits.push(edit);
+
+    let outcome = {
+        let entries = held(&session)?;
+        let arrangement = Arrangement::replaying(entries, &edits);
+        // The change just added is the last one asked for, so a refusal
+        // recorded against it is the answer to this call.
+        let refused = arrangement
+            .refused()
+            .iter()
+            .find(|refusal| refusal.edit + 1 == edits.len())
+            .map(|refusal| refusal.because.say());
+        (refused, Arranged::of(&arrangement))
+    };
+
+    match outcome {
+        (Some(refusal), _) => Err(refusal),
+        (None, arranged) => {
+            session.remember(edits);
+            Ok(arranged)
+        }
+    }
+}
+
+/// Takes back the last change made.
+///
+/// # Errors
+///
+/// Returns a message if nothing has been scanned in this session yet.
+#[tauri::command]
+pub fn take_back(state: State<'_, Shared>) -> Answer<Arranged> {
+    let mut session = state.0.lock().map_err(|_| poisoned())?;
+    let mut edits = session.edits().to_vec();
+    edits.pop();
+
+    let arranged = {
+        let entries = held(&session)?;
+        Arranged::of(&Arrangement::replaying(entries, &edits))
+    };
+    session.remember(edits);
+    Ok(arranged)
+}
+
+/// Everything that would end up somewhere other than where it was.
+///
+/// The old arrangement beside the new one, which is the thing somebody looks at
+/// before deciding whether they meant it.
+///
+/// # Errors
+///
+/// Returns a message if nothing has been scanned in this session yet.
+#[tauri::command]
+pub fn differences(
+    state: State<'_, Shared>,
+    offset: usize,
+    limit: usize,
+) -> Answer<Vec<view::Difference>> {
+    let session = state.0.lock().map_err(|_| poisoned())?;
+    let entries = held(&session)?;
+    let arrangement = Arrangement::replaying(entries, session.edits());
+
+    Ok(arrangement
+        .changes()
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|change| view::Difference {
+            entry: change.entry,
+            was: view::show(&change.was),
+            becomes: change.becomes.as_deref().map(view::show),
+            carried: change.carried,
+        })
+        .collect())
+}
+
+/// What the arrangement comes to, counted up.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Arranged {
+    /// How many changes have been asked for.
+    pub asked: usize,
+    /// How many things would end up somewhere else.
+    pub differences: usize,
+    /// How many folders would be made.
+    pub new_folders: usize,
+    /// How many files would be set aside.
+    pub set_aside: usize,
+}
+
+impl Arranged {
+    fn of(arrangement: &Arrangement<'_>) -> Self {
+        let changes = arrangement.changes();
+        Self {
+            asked: arrangement.asked().len(),
+            differences: changes.len(),
+            new_folders: arrangement.new_directories().len(),
+            set_aside: changes
+                .iter()
+                .filter(|change| change.becomes.is_none())
+                .count(),
+        }
+    }
+}
+
+/// The entries a scan left in this session, or a message saying to scan.
+fn held(session: &session::Session) -> Answer<&[scrub_core::inventory::Entry]> {
+    if session.entries().is_empty() {
+        return Err("there is nothing to rearrange yet — scan this machine first".to_owned());
+    }
+    Ok(session.entries())
 }
 
 /// Works out what is the same file as what.
@@ -175,7 +406,15 @@ pub fn analyze<R: Runtime>(
     )?;
 
     invalidate_after(&out, &[session::PLAN, session::PREFLIGHT]);
-    Ok(findings_of(&analysis))
+
+    let findings = findings_of(&analysis);
+    // Held for rearranging, which is the next thing somebody does with them.
+    state
+        .0
+        .lock()
+        .map_err(|_| poisoned())?
+        .hold(analysis.body.outcome.entries);
+    Ok(findings)
 }
 
 /// The duplicate groups, largest saving first, as one row each (DR-21).
@@ -299,16 +538,17 @@ pub fn plan(
         },
     };
 
-    let (analysis, out, machine) = {
+    let (analysis, out, machine, edits) = {
         let session = state.0.lock().map_err(|_| poisoned())?;
         (
             plainly(session.require(session::ANALYSIS, "look for duplicates"))?,
             session.artifact(session::PLAN),
             plainly(session.machine())?,
+            session.edits().to_vec(),
         )
     };
 
-    let drafted = plainly(scrub_run::plan(&analysis, &rule, machine))?;
+    let drafted = plainly(scrub_run::plan(&analysis, &rule, &edits, machine))?;
     plainly(
         drafted
             .write(&out, scrub_store::Replace::Yes)

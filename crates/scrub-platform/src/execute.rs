@@ -300,6 +300,20 @@ fn relocate(
     // Across filesystems there is no atomic move, so: copy, prove the copy is
     // right, and only then remove the original. Losing the original before the
     // copy is verified is the one outcome that cannot be undone.
+    //
+    // A folder is refused here rather than attempted. The copy below is written
+    // for one file, and a folder copied halfway between two disks is exactly the
+    // half-finished state this project exists to prevent. Moving the files
+    // inside it does the same job, one recoverable step at a time.
+    // DR-11-EXEMPT: stats the source without opening it.
+    if std::fs::symlink_metadata(from).is_ok_and(|found| found.is_dir()) {
+        return Err(Moved::Failed(
+            "that folder would have to move to another disk, which cannot be done \
+             in one step. Move the files inside it instead."
+                .to_owned(),
+        ));
+    }
+
     // DR-11-EXEMPT: the copy half of the move.
     std::fs::copy(from, to).map_err(|error| Moved::Failed(format!("could not copy: {error}")))?;
 

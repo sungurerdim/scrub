@@ -13,6 +13,7 @@
 pub mod analysis;
 pub mod artifact;
 pub mod cloud;
+pub mod edit;
 pub mod inventory;
 pub mod journal;
 pub mod merge;

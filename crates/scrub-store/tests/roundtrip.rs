@@ -477,6 +477,17 @@ fn drafted() -> scrub_store::Plan {
         header,
         body,
         operations,
+        // The changes a person made are part of the artifact, so they are part
+        // of what has to survive being written and read.
+        edits: vec![
+            scrub_core::edit::Edit::NewDirectory {
+                path: PathBuf::from("/home/papers/tax"),
+            },
+            scrub_core::edit::Edit::Rename {
+                entry: 0,
+                to: "kept.txt".to_owned(),
+            },
+        ],
     };
     plan.header.content_digest = plan.content_digest();
     plan
@@ -573,9 +584,26 @@ fn the_canonical_form_has_not_changed_without_anybody_noticing() {
         "dd19ac7ca31234935091259130cb97ffe9e39eb6d6a5ab5867f9399704d91a14",
         "the canonical form changed — bump SCHEMA_VERSION and update this value"
     );
+    // A plan has a canonical form of its own, over the operations and over the
+    // changes somebody asked for. It is pinned separately because it changed
+    // once without this guard noticing — the scan body was untouched, so the
+    // digest above stayed right while the plan's had moved.
+    let operations = vec![scrub_core::plan::Operation::CreateDirectory {
+        path: PathBuf::from("/home/papers"),
+    }];
+    let edits = vec![scrub_core::edit::Edit::Rename {
+        entry: 0,
+        to: "kept.txt".to_owned(),
+    }];
+    assert_eq!(
+        scrub_store::plan_digest(&body, &operations, &edits).to_hex(),
+        "0f0773e2c86792abfbef33514935e3933b0061c185a39798a319eb40eb9d0886",
+        "the canonical form of a plan changed — bump SCHEMA_VERSION and update this"
+    );
+
     assert_eq!(
         scrub_core::artifact::SCHEMA_VERSION,
-        3,
-        "the pinned digest above belongs to this schema version"
+        4,
+        "the pinned digests above belong to this schema version"
     );
 }

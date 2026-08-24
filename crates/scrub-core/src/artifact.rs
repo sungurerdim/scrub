@@ -27,7 +27,9 @@ use uuid::Uuid;
 ///   covers analysis groups as well as the scan body.
 /// - 3 — a file's content digest is the plain BLAKE3 of its content rather than
 ///   a digest of a digest, so `b3sum` agrees with what the tool reports.
-pub const SCHEMA_VERSION: u32 = 3;
+/// - 4 — a plan carries the changes somebody asked for alongside the operations
+///   they came to, and its digest covers both.
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// A BLAKE3-256 digest.
 ///

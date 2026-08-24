@@ -32,6 +32,11 @@ Given the same inventory, the core produces the same analysis on any machine
 
 ## One driver, two interfaces
 
+A plan carries both what a rule decided and what a person asked for, kept apart
+until the plan is drafted: changing the keep-rule should not lose the folder
+somebody made, and taking back a move should not re-decide every duplicate. Where
+they collide, what was asked for wins — it was asked for.
+
 `scrub-run` exists because the command line and the window are two ways of
 asking for the same work. If each drove the stages itself they would drift — one
 would gain a check the other lacked — and two artifacts claiming the same stage
@@ -48,11 +53,30 @@ rather script than click.
 
 ## The window
 
-Three screens, in the order the pipeline runs: **Discover** (what is here, and
-what is not backed up), **Organize** (what is duplicated, and what to do), and
-**Apply** (check it, then carry it out). Only the last one changes anything, and
-only after showing every step and asking in words that name the file count and
-the space involved.
+Four screens, in the order the pipeline runs: **Discover** (what is here, and
+what is not backed up), **Organize** (what is duplicated, and what to do),
+**Arrange** (move things about, with nothing happening), and **Apply** (check
+it, then carry it out). Only the last one changes anything, and only after
+showing every step and asking in words that name the file count and the space
+involved.
+
+Arranging is DR-9 made usable. `scrub-core::edit` holds a picture of the
+filesystem that changes are applied to one at a time, so each change sees the
+world the last one left: rename a folder, then move a file into it by its new
+name, and both work. A folder that moves takes its contents with it and produces
+one operation rather than one per file — the filesystem moves the contents, and
+a move per file would look for each of them at a path it had already left.
+
+Two things are refused there. Folders are never set aside, because moving one is
+an atomic rename within a disk and nothing at all between two, and a half-moved
+folder is the state this project exists to prevent; the files inside it can be
+set aside one recoverable step at a time. And nothing lands on anything, checked
+while it is still a question rather than at operation four hundred (DR-6).
+
+The window keeps the scan's entries in memory while somebody is rearranging.
+That is a deliberate trade: a real machine's inventory is about a gigabyte, and
+reading it again for every folder renamed would make the part of the tool people
+spend time in unusable.
 
 The window holds no rules of its own. It does not decide what a duplicate is,
 what may be moved, or what must be checked first; it asks, and shows the answer.

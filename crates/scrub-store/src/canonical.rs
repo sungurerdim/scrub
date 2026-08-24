@@ -24,12 +24,24 @@ use crate::Body;
 /// of what a plan says: creating a directory after moving into it is a different
 /// plan from doing it before.
 #[must_use]
-pub fn plan_digest(body: &Body, operations: &[scrub_core::plan::Operation]) -> Digest {
+pub fn plan_digest(
+    body: &Body,
+    operations: &[scrub_core::plan::Operation],
+    edits: &[scrub_core::edit::Edit],
+) -> Digest {
     let mut hasher = Hasher::new();
     field(&mut hasher, content_digest(body, &[]).to_hex().as_bytes());
     section(&mut hasher, b"operations", operations.len());
     for operation in operations {
         json(&mut hasher, operation);
+    }
+    // Covered because they are in the artifact. A digest that only covered the
+    // operations would call a plan unaltered after somebody edited the record of
+    // what was asked for, which is exactly the kind of quiet difference the
+    // chain exists to catch.
+    section(&mut hasher, b"edits", edits.len());
+    for edit in edits {
+        json(&mut hasher, edit);
     }
     Digest::from_bytes(*hasher.finalize().as_bytes())
 }
@@ -42,9 +54,13 @@ pub fn preflight_digest(
     verdicts: &[scrub_core::preflight::Verdict],
 ) -> Digest {
     let mut hasher = Hasher::new();
+    // No edits: a preflight carries the operations, not the intent behind them.
+    // A digest has to cover what its own artifact holds and nothing else, or it
+    // cannot be recomputed from the artifact — and the intent is still covered,
+    // through the parent plan's digest recorded in the header.
     field(
         &mut hasher,
-        plan_digest(body, operations).to_hex().as_bytes(),
+        plan_digest(body, operations, &[]).to_hex().as_bytes(),
     );
     section(&mut hasher, b"verdicts", verdicts.len());
     for verdict in verdicts {
@@ -61,9 +77,10 @@ pub fn journal_digest(
     steps: &[scrub_core::journal::Step],
 ) -> Digest {
     let mut hasher = Hasher::new();
+    // As above: a record of what happened, not of what was asked for.
     field(
         &mut hasher,
-        plan_digest(body, operations).to_hex().as_bytes(),
+        plan_digest(body, operations, &[]).to_hex().as_bytes(),
     );
     section(&mut hasher, b"steps", steps.len());
     for step in steps {

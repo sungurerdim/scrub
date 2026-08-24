@@ -5,19 +5,29 @@
 // see what comes next cannot tell whether they have finished.
 
 import { useEffect, useState } from "react";
-import type { Beginning, Findings, Inventory, Outcome, Report, Step } from "./api";
+import type {
+  Arranged,
+  Beginning,
+  Findings,
+  Inventory,
+  Outcome,
+  Report,
+  Step,
+} from "./api";
 import * as api from "./api";
 import * as format from "./format";
 import { Apply } from "./Apply";
+import { Arrange } from "./Arrange";
 import { Discover } from "./Discover";
 import { Organize } from "./Organize";
 import { Trouble } from "./parts";
 
-type Screen = "discover" | "organize" | "apply";
+type Screen = "discover" | "organize" | "arrange" | "apply";
 
 const SCREENS: { id: Screen; name: string; below: string }[] = [
   { id: "discover", name: "Discover", below: "what is here, and what is not backed up" },
   { id: "organize", name: "Organize", below: "what is duplicated, and what to do" },
+  { id: "arrange", name: "Arrange", below: "move things about, with nothing happening" },
   { id: "apply", name: "Apply", below: "check it, then carry it out" },
 ];
 
@@ -30,6 +40,7 @@ export function App() {
   const [findings, setFindings] = useState<Findings | null>(null);
   const [steps, setSteps] = useState<Step[] | null>(null);
   const [outcome, setOutcome] = useState<Outcome | null>(null);
+  const [arranged, setArranged] = useState<Arranged | null>(null);
   const [token, setToken] = useState(0);
 
   const [busy, setBusy] = useState(false);
@@ -85,9 +96,13 @@ export function App() {
     );
   }
 
+  const scanned = inventory !== null || beginning.ready.includes("scan");
   const reached: Record<Screen, boolean> = {
     discover: true,
-    organize: inventory !== null || beginning.ready.includes("scan"),
+    organize: scanned,
+    // Rearranging needs only a scan: somebody who wants to tidy their folders
+    // should not have to sit through a duplicate hunt first.
+    arrange: scanned,
     apply: steps !== null || beginning.ready.includes("plan"),
   };
 
@@ -132,6 +147,7 @@ export function App() {
                 setFindings(null);
                 setSteps(null);
                 setOutcome(null);
+                setArranged(null);
                 setScreen("organize");
               }}
             />
@@ -158,6 +174,21 @@ export function App() {
             />
           )}
 
+          {screen === "arrange" && (
+            <Arrange
+              arranged={arranged}
+              busy={busy}
+              run={run}
+              onArranged={(now) => {
+                setArranged(now);
+                // The plan was drafted from an arrangement that has changed.
+                setSteps(null);
+                setOutcome(null);
+              }}
+              onTrouble={setTrouble}
+            />
+          )}
+
           {screen === "apply" && (
             <Apply
               steps={steps}
@@ -166,6 +197,7 @@ export function App() {
               run={run}
               onChecked={setSteps}
               onRan={setOutcome}
+              onTrouble={setTrouble}
             />
           )}
         </div>

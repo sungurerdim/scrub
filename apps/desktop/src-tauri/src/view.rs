@@ -284,6 +284,43 @@ pub struct StepVerdict {
     pub impediment: Option<String>,
 }
 
+/// One thing in a folder, as the browser shows it.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Item {
+    /// Which entry of the inventory, or `usize::MAX` for a folder that is only
+    /// going to exist.
+    pub entry: usize,
+    /// What it is called now, after any change.
+    pub name: String,
+    /// Where it is now, after any change.
+    pub path: String,
+    /// Whether it holds other things.
+    pub is_folder: bool,
+    /// How big it is.
+    pub size: u64,
+    /// When it last changed, where the platform recorded it.
+    pub modified: Option<i64>,
+    /// Whether its content is on this disk.
+    pub local: bool,
+    /// Whether it is somewhere other than where the scan found it.
+    pub moved: bool,
+}
+
+/// One line of the old arrangement beside the new one.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Difference {
+    /// Which entry of the inventory.
+    pub entry: usize,
+    /// Where it was when the scan ran.
+    pub was: String,
+    /// Where it will be, or absent if it is being set aside.
+    pub becomes: Option<String>,
+    /// Whether it moved because a folder above it moved, rather than by itself.
+    pub carried: bool,
+}
+
 /// Renders a path for the window.
 ///
 /// Lossy on purpose, and only here: the stored path keeps the exact bytes, and

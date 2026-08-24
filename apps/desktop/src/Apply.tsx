@@ -12,6 +12,7 @@ import { useState } from "react";
 import type { Outcome, Runner, Step } from "./api";
 import * as api from "./api";
 import * as format from "./format";
+import { Differences } from "./Arrange";
 import { Button, Card, Figure, Nothing, Path, Trouble } from "./parts";
 
 export function Apply({
@@ -21,6 +22,7 @@ export function Apply({
   run,
   onChecked,
   onRan,
+  onTrouble,
 }: {
   steps: Step[] | null;
   outcome: Outcome | null;
@@ -28,6 +30,7 @@ export function Apply({
   run: Runner;
   onChecked: (checked: Step[]) => void;
   onRan: (came: Outcome | null) => void;
+  onTrouble: (message: string) => void;
 }) {
   const [fast, setFast] = useState(false);
   const [confirming, setConfirming] = useState(false);
@@ -53,14 +56,21 @@ export function Apply({
 
   if (!steps) {
     return (
-      <Card title="Nothing to carry out">
-        <Nothing>Decide what should happen first, on the previous step.</Nothing>
-      </Card>
+      <div className="space-y-5">
+        <Differences onTrouble={onTrouble} />
+        <Card title="Nothing to carry out yet">
+          <Nothing>
+            Decide what should happen first — choose which copy of a duplicate to keep,
+            or rearrange something.
+          </Nothing>
+        </Card>
+      </div>
     );
   }
 
   return (
     <div className="space-y-5">
+      <Differences onTrouble={onTrouble} />
       <Card
         title="Check the plan against the disk"
         hint="Every file is looked at again and its contents read, to be sure it is still the file the plan was made about. Nothing is changed by checking."

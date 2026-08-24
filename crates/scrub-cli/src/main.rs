@@ -265,7 +265,9 @@ fn plan(
         },
     };
 
-    let drafted = scrub_run::plan(analysis, &rule, machine::identity()?)?;
+    // The command line drafts from the rule alone. Rearranging by hand is
+    // what the window is for, and a plan it wrote keeps those changes.
+    let drafted = scrub_run::plan(analysis, &rule, &[], machine::identity()?)?;
     drafted.write(out, scrub_run::replacement(replace))?;
 
     report::describe_plan(&drafted, &rule, Some(out));

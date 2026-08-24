@@ -230,13 +230,21 @@ pub struct Plan {
     pub body: Body,
     /// What should happen, in the order it should happen.
     pub operations: Vec<Operation>,
+    /// The changes somebody asked for, in the order they asked.
+    ///
+    /// Empty for a plan that came from a rule rather than from a person. Kept
+    /// beside the operations rather than instead of them: the operations are
+    /// what gets carried out, and these are what somebody recognises as the
+    /// thing they did — which is what has to be shown when they come back and
+    /// want to take one of them back (DR-9).
+    pub edits: Vec<scrub_core::edit::Edit>,
 }
 
 impl Plan {
     /// The digest of this artifact's content, in canonical form.
     #[must_use]
     pub fn content_digest(&self) -> Digest {
-        canonical::plan_digest(&self.body, &self.operations)
+        canonical::plan_digest(&self.body, &self.operations, &self.edits)
     }
 
     /// Whether these paths can be acted on by this machine.
@@ -270,6 +278,7 @@ impl Plan {
         let transaction = connection.transaction()?;
         schema::write_body(&transaction, &self.header, &self.body)?;
         schema::write_operations(&transaction, &self.body.outcome.entries, &self.operations)?;
+        schema::write_edits(&transaction, &self.edits)?;
         transaction.commit()?;
         Ok(())
     }
@@ -293,6 +302,7 @@ impl Plan {
             header,
             body,
             operations: schema::read_operations(&connection)?,
+            edits: schema::read_edits(&connection)?,
         };
 
         let actual = plan.content_digest();
