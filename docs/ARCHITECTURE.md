@@ -25,17 +25,18 @@ for CI here. Keeping storage in its own crate means every line of
 Windows-specific code stays in `scrub-platform`, where it can still be
 type-checked for both Windows architectures from a Mac.
 
-`scrub-core` holds no I/O beyond reading and writing artifacts. Given the same
-inventory it produces the same analysis on any machine (DR-12), which is what makes
-golden-file testing possible.
+Given the same inventory, the core produces the same analysis on any machine
+(DR-12), which is what makes golden-file testing possible.
 
-The command line exists so that every stage can be exercised by machine in CI —
-not as a second product surface. The graphical interface is a thin layer over the
-same crates and has no logic of its own.
+The command line exists so every stage can be driven and checked by machine, not
+as a second product surface. The graphical interface will be a thin layer over
+the same crates, with no logic of its own.
 
 ## Platform layer
 
-Everything platform-specific lives behind one trait, implemented twice.
+Everything platform-specific lives in one module per platform, behind one
+identical set of functions. A third module covers everywhere else, and refuses
+to scan rather than guessing that a placeholder is an ordinary file.
 
 **macOS.** Cloud files are File Provider objects. A file whose content is not
 present on disk is *dataless*: `st_flags` carries `SF_DATALESS`, and `st_blocks` is
@@ -54,9 +55,11 @@ usually alongside `FILE_ATTRIBUTE_OFFLINE`, and report zero size on disk. Metada
 access uses `FILE_FLAG_OPEN_NO_RECALL`, which reads attributes without asking the
 sync provider to hydrate.
 
-Both implementations answer the same questions: which provider owns this path, is
-the content present locally, is it pinned, and what does the provider believe about
-it. Both are covered by the same fixture-driven tests.
+Both answer the same questions: which provider owns this path, is the content
+present locally, is it pinned, and what does the provider say about a link out of
+its directory. The attribute rules for Windows live in their own module compiled
+on every platform, so they are exercised by the ordinary test run rather than
+only wherever a Windows machine happens to be.
 
 ## Traversal
 
@@ -100,7 +103,8 @@ above is the baseline any such change has to beat by enough to be worth it.
 ## Stack
 
 Every version below was verified against its registry on 2026-08-24 and is pinned
-in `Cargo.toml` and `package.json`.
+in `Cargo.toml` and `package.json`. Rows below the command line are chosen but
+not yet in use; they arrive with the stage that needs them.
 
 | Concern | Choice | Version |
 |---|---|---|
@@ -110,7 +114,6 @@ in `Cargo.toml` and `package.json`.
 | Virtualized tables and trees | TanStack Virtual · Table | 3.14 · 9.1 |
 | Artifacts | SQLite via rusqlite, bundled | 0.40 |
 | Content digest | blake3 | 1.8 |
-| Parallel traversal | jwalk · rayon | 0.9 · 1.12 |
 | Perceptual image hashing | image_hasher | 3.1 |
 | Content type detection | infer · file-format | 0.22 · 0.29 |
 | Document text extraction | pdf-extract · docx-rs | 0.12 · 0.4 |
@@ -119,6 +122,7 @@ in `Cargo.toml` and `package.json`.
 | macOS system bindings | objc2 · objc2-photos | 0.6 · 0.3 |
 | Windows system bindings | windows | 0.62 |
 | Command line | clap | 4.6 |
+| Timestamps | jiff | 0.2 |
 
 Two notes on selection. `img_hash` is the commonly recommended perceptual hashing
 crate and has been unmaintained since 2021; we use the maintained fork
