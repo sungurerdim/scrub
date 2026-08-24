@@ -177,6 +177,32 @@ space the tool promises to recover, in violation of DR-16.
 
 ## Cloud APIs
 
+### A thread spawned after the policy is set is still covered
+
+**Grade: observed.** Parallel reading depends on it: if a worker thread did not
+inherit the process's materialization policy, spreading the work across threads
+would quietly undo the one guarantee that makes reading safe at all.
+
+`setiopolicy_np(3)` says of `IOPOL_MATERIALIZE_DATALESS_FILES_DEFAULT`: "For
+`IOPOL_SCOPE_THREAD`, all accesses by the current thread will follow the process
+policy." A thread that has set nothing of its own is therefore governed by the
+process policy, which this tool sets to `OFF` before any read.
+
+Measured on macOS 26.6 with a probe that sets the policy at process scope, spawns
+a thread, and asks the kernel from inside it:
+
+```
+set at process scope -> 0
+main thread reports    -> thread 0
+spawned thread reports -> thread 0, process 1
+```
+
+`0` at thread scope is `IOPOL_..._DEFAULT`, not "materialization allowed" — the
+main thread, which is known to be protected, reports the same. `1` at process
+scope is `OFF`. A first reading of this probe got it backwards, which is recorded
+here because the mistake is an easy one and the wrong conclusion would have been
+to abandon parallelism for a danger that was not there.
+
 ### A full Drive inventory needs a restricted scope
 
 **Grade: specified.** Google's restricted scope verification documentation

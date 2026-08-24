@@ -214,6 +214,32 @@ done yet: it trades away some of how legible the file is to someone poking at it
 in a database browser, which is a promise (DR-3) rather than a nicety. The figure
 above is the baseline any such change has to beat by enough to be worth it.
 
+## Reading in parallel
+
+Analysis is where the time goes, and it is spent waiting on a disk rather than on
+a processor: the single-threaded pass ran at 31% of one core. The reading is
+therefore shared across as many threads as the machine reports, and measured
+alternately against the version without it, on the same inventory of 155 GB:
+
+| | run 1 | run 2 |
+|---|---|---|
+| one thread | 143.4 s | 149.3 s |
+| shared out | 31.7 s | 31.1 s |
+
+Alternating the two removes the page cache from the comparison — both benefit
+from whatever the other left warm.
+
+This is safe only because the kernel policy forbidding downloads is set on the
+process rather than on the thread that set it, which was measured rather than
+assumed (see `docs/VERIFICATION.md`). Were it otherwise, every worker would be an
+unprotected reader, and the guarantee that makes reading safe at all would have
+been quietly undone by an optimisation.
+
+The answer does not depend on how the work was divided: each file's digest is a
+function of that file alone, and results are gathered into a map with no order of
+its own. Proven by digesting a fixed tree with both versions and comparing the
+artifacts, which came to the same content digest (DR-12).
+
 ## Stack
 
 Every version below was verified against its registry on 2026-08-24 and is pinned

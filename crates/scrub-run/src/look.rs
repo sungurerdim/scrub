@@ -8,6 +8,8 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use scrub_core::analysis::Settled;
 use scrub_core::artifact::{Digest, MachineId, Stage};
@@ -210,7 +212,30 @@ fn run_passes(
     settled
 }
 
-/// One pass over a list of files.
+/// Below this many files, one thread does it.
+///
+/// Spawning costs more than it saves on a handful of files, and the tests are
+/// full of handfuls.
+const WORTH_SHARING_OUT: usize = 64;
+
+/// How often the progress of a shared-out pass is reported.
+const LOOK_IN_EVERY: Duration = Duration::from_millis(80);
+
+/// One pass over a list of files, shared across threads.
+///
+/// Reading is where the time goes, and it is spent waiting on a disk rather than
+/// on a processor: the single-threaded pass measured 31% of one core over two
+/// minutes. Several threads waiting at once turn most of that into overlap.
+///
+/// This is safe only because the kernel policy that forbids downloads is set on
+/// the *process*, not on the thread that set it — `setiopolicy_np(3)` says a
+/// thread which has set nothing of its own follows the process policy, and that
+/// was measured rather than assumed (see `docs/VERIFICATION.md`). Were it
+/// otherwise, every worker here would be an unprotected reader.
+///
+/// The answer does not depend on how the work was divided: each file's digest is
+/// a function of that file, and the results are gathered into a map with no
+/// order of its own (DR-12).
 fn read_pass(
     entries: &[Entry],
     indices: &[usize],
@@ -218,36 +243,150 @@ fn read_pass(
     pass: Pass,
     watch: &mut dyn Watch,
 ) -> HashMap<usize, Digest> {
-    let mut digests = HashMap::with_capacity(indices.len());
-    let mut bytes = 0_u64;
-
-    for (done, index) in indices.iter().enumerate() {
-        let entry = &entries[*index];
-        let outcome = if pass == Pass::Sampling {
-            scrub_platform::digest::quick_digest(
-                &entry.path,
-                &entry.cloud,
-                entry.logical_size,
-                mode,
-            )
-        } else {
-            scrub_platform::digest::full_digest(&entry.path, &entry.cloud, entry.logical_size, mode)
-        };
-        // A refusal is not reported loudly here: the file stays unsettled, and
-        // the group it belongs to says why.
-        if let Ok(digest) = outcome {
-            digests.insert(*index, digest);
-            bytes += entry.logical_size;
+    let hands = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    if hands <= 1 || indices.len() < WORTH_SHARING_OUT {
+        let mut digests = HashMap::with_capacity(indices.len());
+        let mut bytes = 0_u64;
+        for (done, index) in indices.iter().enumerate() {
+            if let Some(digest) = read_one(&entries[*index], pass, mode) {
+                digests.insert(*index, digest);
+                bytes += entries[*index].logical_size;
+            }
+            watch.reading(pass, done + 1, bytes);
         }
-        watch.reading(pass, done + 1, bytes);
+        return digests;
     }
 
-    digests
+    let taken = AtomicUsize::new(0);
+    let done = AtomicUsize::new(0);
+    let bytes = AtomicU64::new(0);
+    // Counted down as each worker leaves, including one that leaves by
+    // panicking. Without it, a panic before the last increment would leave the
+    // loop below waiting for progress that is never coming.
+    let working = AtomicUsize::new(hands);
+
+    let gathered: Vec<Vec<(usize, Digest)>> = std::thread::scope(|scope| {
+        let hired: Vec<_> = (0..hands)
+            .map(|_| {
+                scope.spawn(|| {
+                    let _leaving = Leaving(&working);
+                    let mut mine = Vec::new();
+                    loop {
+                        let next = taken.fetch_add(1, Ordering::Relaxed);
+                        let Some(index) = indices.get(next) else {
+                            break;
+                        };
+                        let entry = &entries[*index];
+                        // A refusal is not reported loudly: the file stays
+                        // unsettled, and the group it belongs to says why.
+                        if let Some(digest) = read_one(entry, pass, mode) {
+                            mine.push((*index, digest));
+                            bytes.fetch_add(entry.logical_size, Ordering::Relaxed);
+                        }
+                        done.fetch_add(1, Ordering::Relaxed);
+                    }
+                    mine
+                })
+            })
+            .collect();
+
+        while working.load(Ordering::Relaxed) > 0 {
+            watch.reading(
+                pass,
+                done.load(Ordering::Relaxed),
+                bytes.load(Ordering::Relaxed),
+            );
+            std::thread::sleep(LOOK_IN_EVERY);
+        }
+
+        hired
+            .into_iter()
+            .map(|worker| {
+                // A worker only panics on a bug. Carrying the panic out keeps it
+                // a crash somebody investigates rather than a quietly short
+                // answer that looks like a clean run.
+                worker
+                    .join()
+                    .unwrap_or_else(|reason| std::panic::resume_unwind(reason))
+            })
+            .collect()
+    });
+
+    watch.reading(
+        pass,
+        done.load(Ordering::Relaxed),
+        bytes.load(Ordering::Relaxed),
+    );
+    gathered.into_iter().flatten().collect()
+}
+
+/// Marks a worker as gone, however it goes.
+struct Leaving<'a>(&'a AtomicUsize);
+
+impl Drop for Leaving<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Reads one file, as much of it as this pass calls for.
+fn read_one(entry: &Entry, pass: Pass, mode: &scrub_platform::ScanMode) -> Option<Digest> {
+    let outcome = if pass == Pass::Sampling {
+        scrub_platform::digest::quick_digest(&entry.path, &entry.cloud, entry.logical_size, mode)
+    } else {
+        scrub_platform::digest::full_digest(&entry.path, &entry.cloud, entry.logical_size, mode)
+    };
+    outcome.ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sharing_the_reading_out_does_not_change_the_answer() {
+        // Reading is spread across threads, and the order files come back in
+        // depends on how the operating system felt at that moment. The answer
+        // must not (DR-12) — an analysis that differed run to run would make
+        // the artifact undiffable and every review of it worthless.
+        //
+        // The tree is deliberately over the threshold at which the work is
+        // shared out, so this exercises the path that has threads in it.
+        let place = tempfile::tempdir().expect("a temporary directory");
+        let root = place.path();
+        for shape in 0..40 {
+            let body = format!("body number {shape}").repeat(20);
+            // Three copies of each, so grouping has something to group.
+            for copy in 0..3 {
+                std::fs::write(root.join(format!("shape{shape}-copy{copy}.txt")), &body)
+                    .expect("write");
+            }
+        }
+        assert!(
+            std::fs::read_dir(root).expect("read").count() > WORTH_SHARING_OUT,
+            "the fixture has to be big enough to be shared out"
+        );
+
+        let workspace = tempfile::tempdir().expect("somewhere for the artifacts");
+        let machine = MachineId::generate();
+        let inventory = scan(&[root.to_path_buf()], machine, &mut crate::Silent).expect("a scan");
+        let recorded = workspace.path().join("fixture.inventory");
+        inventory
+            .write(&recorded, scrub_store::Replace::Never)
+            .expect("the inventory writes");
+
+        let once = analyze(&recorded, machine, Depth::Duplicates, &mut crate::Silent)
+            .expect("an analysis");
+        let twice = analyze(&recorded, machine, Depth::Duplicates, &mut crate::Silent)
+            .expect("a second analysis of the same thing");
+
+        assert_eq!(
+            once.header.content_digest, twice.header.content_digest,
+            "the same inventory read twice has to come to the same answer"
+        );
+        assert_eq!(once.settled, twice.settled, "down to every single file");
+        assert_eq!(once.groups.len(), 40, "forty sets of three");
+    }
 
     #[test]
     fn a_thorough_pass_offers_more_to_read_than_a_duplicate_pass() {
