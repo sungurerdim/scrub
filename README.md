@@ -89,6 +89,7 @@ layer of its own.
 | [`docs/DESIGN-RULES.md`](docs/DESIGN-RULES.md) | The binding rules. Every change is reviewed against them. |
 | [`docs/PIPELINE.md`](docs/PIPELINE.md) | The seven stages, their artifacts, and the build order. |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Crate layout, platform layer, dependency choices. |
+| [`docs/VERIFICATION.md`](docs/VERIFICATION.md) | Every platform behaviour the design relies on, with where it was verified. |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | How to contribute. |
 | [`SECURITY.md`](SECURITY.md) | Threat model and reporting. |
 

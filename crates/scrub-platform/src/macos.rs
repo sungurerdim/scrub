@@ -11,12 +11,13 @@
 //! `SF_DATALESS` from `sys/stat.h`, the I/O policy values from `sys/resource.h`,
 //! and the `setiopolicy_np` argument order from its manual page.
 
-use std::ffi::c_int;
+use std::ffi::{CString, c_char, c_int, c_void};
 use std::os::macos::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
 use crate::{
-    CloudRoot, Detection, PlatformError, Provider, Residency, Retention, RootOrigin, UnresolvedLink,
+    CloudRoot, Detection, LinkVerdict, PlatformError, Provider, ProviderLink, Residency, Retention,
+    RootOrigin,
 };
 
 /// `sys/stat.h`: "file is dataless object".
@@ -43,7 +44,46 @@ const IOPOL_ATIME_UPDATES_OFF: c_int = 1;
 unsafe extern "C" {
     /// `setiopolicy_np(int iotype, int scope, int policy)` from `sys/resource.h`.
     fn setiopolicy_np(iotype: c_int, scope: c_int, policy: c_int) -> c_int;
+
+    /// `getxattr` from `sys/xattr.h`.
+    ///
+    /// Used only to ask whether an attribute is present, never to read a user's
+    /// data. Declared here because the standard library has no extended
+    /// attribute interface.
+    fn getxattr(
+        path: *const c_char,
+        name: *const c_char,
+        value: *mut c_void,
+        size: usize,
+        position: u32,
+        options: c_int,
+    ) -> isize;
 }
+
+/// `sys/xattr.h`: read the attribute from the link itself, not its target.
+///
+/// The default is the opposite, and the manual page says so outright: "getxattr
+/// normally returns information from the target of path if it is a symbolic
+/// link." Omitting this flag inverts the answer to the single most consequential
+/// question this module asks.
+const XATTR_NOFOLLOW: c_int = 0x0001;
+
+/// Set by iCloud on a link to a folder it has detached from synchronization.
+///
+/// Undocumented by Apple, so it is read in one direction only: present means the
+/// target is definitively not backed up; absent means nothing at all.
+const XATTR_FILEPROVIDER_IGNORE: &[u8] = b"com.apple.fileprovider.ignore#P\0";
+
+/// Directories a provider creates inside its own storage as working state.
+///
+/// Their presence at a link's target means the target is that provider's own
+/// content — Google Drive in mirror mode points out of its streaming directory
+/// exactly this way, with its download staging directory at the far end.
+const PROVIDER_MARKERS: [(&str, Provider); 3] = [
+    (".tmp.drivedownload", Provider::GoogleDrive),
+    (".shortcut-targets-by-id", Provider::GoogleDrive),
+    (".dropbox.cache", Provider::Dropbox),
+];
 
 /// Proof that the process is running under the read-only scan policy.
 ///
@@ -146,7 +186,7 @@ pub fn detect(home: &Path) -> Result<Detection, PlatformError> {
 /// Whether these belong to the provider is not decidable here (DR-22); the
 /// caller filters out those whose targets turn out to sit inside another known
 /// provider directory, and the rest are put to the user.
-fn collect_outward_links(root: &CloudRoot, links: &mut Vec<UnresolvedLink>) {
+fn collect_outward_links(root: &CloudRoot, links: &mut Vec<ProviderLink>) {
     // DR-11-EXEMPT: enumerates a provider mount point, which is an ordinary
     // local directory, and reads only link targets — never link contents.
     //
@@ -172,12 +212,58 @@ fn collect_outward_links(root: &CloudRoot, links: &mut Vec<UnresolvedLink>) {
         } else {
             root.path.join(target)
         };
-        links.push(UnresolvedLink {
+        let verdict = link_verdict(&path, &target);
+        links.push(ProviderLink {
             link: path,
             target,
             provider: root.provider.clone(),
+            verdict,
         });
     }
+}
+
+/// Asks the platform and the provider what a link means, before asking the user.
+fn link_verdict(link: &Path, target: &Path) -> LinkVerdict {
+    if has_xattr_nofollow(link, XATTR_FILEPROVIDER_IGNORE) {
+        return LinkVerdict::ExcludedByProvider;
+    }
+    if PROVIDER_MARKERS
+        .iter()
+        .any(|(marker, _)| target.join(marker).exists())
+    {
+        return LinkVerdict::ProviderOwned;
+    }
+    LinkVerdict::Unsettled
+}
+
+/// Whether an extended attribute is present **on the link itself**.
+///
+/// Only presence is tested; the value is never read into memory. Any failure —
+/// the attribute is missing, the path has a NUL byte, permission is refused —
+/// answers `false`, which routes the link to the user rather than to a guess.
+fn has_xattr_nofollow(path: &Path, name: &[u8]) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+
+    // SAFETY: both pointers address NUL-terminated buffers that outlive the
+    // call. A null value pointer with size zero is the documented way to query
+    // an attribute's length without retrieving it, so nothing is written back.
+    #[allow(unsafe_code)]
+    let length = unsafe {
+        getxattr(
+            path.as_ptr(),
+            name.as_ptr().cast::<c_char>(),
+            std::ptr::null_mut(),
+            0,
+            0,
+            XATTR_NOFOLLOW,
+        )
+    };
+
+    length >= 0
 }
 
 /// iCloud Drive itself, plus every per-application container beside it.

@@ -137,23 +137,49 @@ pub enum RootOrigin {
     LegacyLocation,
 }
 
-/// A symbolic link at the top of a provider directory, pointing outside every
-/// provider directory we know about.
+/// What the provider itself says about a link out of its directory.
 ///
-/// Deliberately not resolved (DR-22). The same shape means opposite things: a
-/// link out of iCloud Drive to an unsynchronized Desktop, and a link out of a
-/// Google Drive mount to that drive's main folder, are indistinguishable from
-/// the filesystem. Following it would falsely report unsynchronized files as
-/// backed up; ignoring it would silently omit a whole drive. So it is put to the
-/// user instead of guessed at.
+/// Read before the user is ever asked (DR-22). Both platforms leave evidence,
+/// and it settles most links outright; `docs/VERIFICATION.md` records what each
+/// signal is and how it was confirmed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkVerdict {
+    /// The provider explicitly excludes this link from synchronization.
+    ///
+    /// Conclusive: the target is **not** backed up by this provider, whatever
+    /// its position in the directory tree suggests. On macOS this is the
+    /// `com.apple.fileprovider.ignore` attribute that iCloud leaves on a link to
+    /// a folder it has detached.
+    ExcludedByProvider,
+    /// The target carries the provider's own working state.
+    ///
+    /// The link is the provider's own, and its target genuinely holds that
+    /// provider's content — Google Drive in mirror mode points out of its
+    /// streaming directory exactly this way.
+    ProviderOwned,
+    /// Neither platform nor provider said anything. Only the user can settle it.
+    Unsettled,
+}
+
+/// A symbolic link leading out of a provider directory.
+///
+/// The same shape means opposite things, which is why the verdict is carried
+/// alongside rather than baked into a boolean: a link out of iCloud Drive to an
+/// unsynchronized Desktop, and a link out of a Google Drive mount to that
+/// drive's own content, look identical. Following the first would falsely report
+/// unsynchronized files as backed up; ignoring the second would silently omit an
+/// entire drive.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct UnresolvedLink {
+pub struct ProviderLink {
     /// The link itself, inside a provider directory.
     pub link: PathBuf,
-    /// Where it points, verbatim as stored.
+    /// Where it points, made absolute.
     pub target: PathBuf,
     /// The provider whose directory contains the link.
     pub provider: Provider,
+    /// What the provider said about it.
+    pub verdict: LinkVerdict,
 }
 
 /// What a platform scan found.
@@ -161,8 +187,8 @@ pub struct UnresolvedLink {
 pub struct Detection {
     /// Directories owned by a sync provider.
     pub roots: Vec<CloudRoot>,
-    /// Links out of those directories that only the user can settle.
-    pub links: Vec<UnresolvedLink>,
+    /// Links leading out of those directories.
+    pub links: Vec<ProviderLink>,
 }
 
 /// A directory owned by a sync provider.
@@ -187,7 +213,7 @@ pub struct CloudRoot {
 #[derive(Clone, Debug, Default)]
 pub struct CloudMap {
     roots: Vec<CloudRoot>,
-    links: Vec<UnresolvedLink>,
+    links: Vec<ProviderLink>,
 }
 
 impl CloudMap {
@@ -205,10 +231,13 @@ impl CloudMap {
     /// Records links, keeping only those that genuinely lead outside.
     ///
     /// A link pointing from one provider directory into another is ordinary
-    /// plumbing and settles itself; only a link leading outside every known
-    /// provider directory is a question for the user (DR-22).
+    /// internal plumbing and settles itself — Google Drive resolves every
+    /// shortcut this way, into a hidden directory inside the same drive.
+    /// Traversal reaches those targets once on its own, so recording the links
+    /// as questions would be noise, and following them would count the same
+    /// bytes once per shortcut (DR-16).
     #[must_use]
-    pub fn with_links(mut self, links: Vec<UnresolvedLink>) -> Self {
+    pub fn with_links(mut self, links: Vec<ProviderLink>) -> Self {
         self.links = links
             .into_iter()
             .filter(|link| self.owner_of(&link.target).is_none())
@@ -216,10 +245,28 @@ impl CloudMap {
         self
     }
 
-    /// Links out of a provider directory that only the user can settle (DR-22).
+    /// Every link leading out of a provider directory, with its verdict.
     #[must_use]
-    pub fn unresolved_links(&self) -> &[UnresolvedLink] {
+    pub fn links(&self) -> &[ProviderLink] {
         &self.links
+    }
+
+    /// Links the provider itself excluded from synchronization.
+    ///
+    /// Worth surfacing prominently: each one is a folder the user very likely
+    /// believes is in the cloud, sitting inside the cloud directory, that the
+    /// provider is not backing up.
+    pub fn excluded_links(&self) -> impl Iterator<Item = &ProviderLink> {
+        self.links
+            .iter()
+            .filter(|link| link.verdict == LinkVerdict::ExcludedByProvider)
+    }
+
+    /// Links no signal could settle, which only the user can answer (DR-22).
+    pub fn unsettled_links(&self) -> impl Iterator<Item = &ProviderLink> {
+        self.links
+            .iter()
+            .filter(|link| link.verdict == LinkVerdict::Unsettled)
     }
 
     /// Builds a map from a known set of roots. Used by tests and by the merge
@@ -398,11 +445,12 @@ mod tests {
         );
     }
 
-    fn link(from: &str, to: &str) -> UnresolvedLink {
-        UnresolvedLink {
+    fn link(from: &str, to: &str, verdict: LinkVerdict) -> ProviderLink {
+        ProviderLink {
             link: PathBuf::from(from),
             target: PathBuf::from(to),
             provider: Provider::ICloud,
+            verdict,
         }
     }
 
@@ -414,12 +462,10 @@ mod tests {
         let map = sample_map().with_links(vec![link(
             "/home/Library/Mobile Documents/com~apple~CloudDocs/Desktop",
             "/home/Desktop",
+            LinkVerdict::Unsettled,
         )]);
-        assert_eq!(map.unresolved_links().len(), 1);
-        assert_eq!(
-            map.unresolved_links()[0].target,
-            PathBuf::from("/home/Desktop")
-        );
+        assert_eq!(map.unsettled_links().count(), 1);
+        assert_eq!(map.links()[0].target, PathBuf::from("/home/Desktop"));
     }
 
     #[test]
@@ -429,13 +475,43 @@ mod tests {
         let map = sample_map().with_links(vec![link(
             "/home/Library/Mobile Documents/com~apple~CloudDocs/shared",
             "/home/Library/CloudStorage/GoogleDrive-someone@example.com/shared",
+            LinkVerdict::Unsettled,
         )]);
-        assert!(map.unresolved_links().is_empty());
+        assert!(map.links().is_empty());
     }
 
     #[test]
     fn a_map_with_no_links_reports_none() {
-        assert!(sample_map().unresolved_links().is_empty());
+        assert!(sample_map().links().is_empty());
+    }
+
+    #[test]
+    fn an_excluded_link_is_separated_from_an_unsettled_one() {
+        // These two need different treatment: the first is a finding to show the
+        // user ("this folder is not backed up"), the second is a question to ask
+        // them. Merging them would either alarm people about ordinary plumbing
+        // or bury a real gap among questions.
+        let map = sample_map().with_links(vec![
+            link(
+                "/home/Library/Mobile Documents/com~apple~CloudDocs/Documents",
+                "/home/Documents",
+                LinkVerdict::ExcludedByProvider,
+            ),
+            link(
+                "/home/Library/CloudStorage/GoogleDrive-someone@example.com/My Drive",
+                "/home/My Drive",
+                LinkVerdict::ProviderOwned,
+            ),
+            link(
+                "/home/Library/Mobile Documents/com~apple~CloudDocs/mystery",
+                "/home/mystery",
+                LinkVerdict::Unsettled,
+            ),
+        ]);
+
+        assert_eq!(map.excluded_links().count(), 1);
+        assert_eq!(map.unsettled_links().count(), 1);
+        assert_eq!(map.links().len(), 3);
     }
 
     #[test]

@@ -171,11 +171,29 @@ backed up when losing them would have lost them for good. The same machine's
 Google Drive reached its main folder through a link pointing outward; refusing to
 look would have silently omitted the entire drive from the inventory.
 
-The two are indistinguishable from the filesystem, so the tool does not guess. A
-link at the top of a provider directory whose target lies outside every known
-provider directory is recorded as an **unresolved link** and put to the user:
-this is here, it points there, does it belong to this provider? Until answered,
-its target is neither scanned as cloud content nor silently dropped.
+The two are indistinguishable *by shape*, so the tool asks the provider before it
+asks the user. Both platforms leave evidence, and reading it settles most cases
+outright — see `docs/VERIFICATION.md` for what each signal is and how it was
+confirmed. Only when every signal is silent is the link recorded as an
+**unresolved link** and put to the user: this is here, it points there, does it
+belong to this provider? Until answered, its target is neither counted as backed
+up nor silently dropped.
+
+Evidence is read in one direction only. A signal saying a link is excluded from
+sync is conclusive; the absence of any signal never means it is included. Where
+the vendor does not document the signal we rely on, that asymmetry is what keeps
+an undocumented change from turning into a false promise.
+
+### DR-23 — A container we could not read is never reported as empty
+
+A directory that could not be enumerated — permission refused, the device
+disconnected, or a cloud-only folder we declined to download — is recorded as
+*unread*, with the reason, and its contents are recorded as unknown.
+
+It is never reported as containing nothing. The difference is the difference
+between "this folder is empty" and "I could not look inside", and the user acts
+very differently on each. Every count the tool presents distinguishes what it
+measured from what it could not reach, and no total silently absorbs the gap.
 
 ## D. Pipeline
 

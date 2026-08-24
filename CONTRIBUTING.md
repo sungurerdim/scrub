@@ -13,6 +13,12 @@ If you believe a rule is wrong, open an issue proposing an amendment. The rules 
 versioned and can change — deliberately, in the open, and never by working around
 them in a pull request.
 
+Claims about platform behaviour belong in
+[`docs/VERIFICATION.md`](docs/VERIFICATION.md), with the source they came from and
+the grade of that evidence. If a change relies on how a provider behaves, verify
+it against vendor documentation or measure it, and add the entry in the same pull
+request. "I remember that it works this way" is not a source.
+
 ## The rules that trip people up
 
 Three come up more than the rest.
