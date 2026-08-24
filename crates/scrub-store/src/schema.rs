@@ -5,10 +5,12 @@
 //! per thing, and enumerated values stored as their names rather than as
 //! numbers nobody can interpret.
 //!
-//! Paths are stored twice on purpose. `path` holds the original bytes exactly as
-//! the filesystem gave them; `path_text` holds a rendering for reading and for
-//! `LIKE` queries. The bytes are what the tool acts on, because a path that has
-//! been through a lossy conversion is a path that may no longer point anywhere.
+//! Paths are stored as text, which reproduces very nearly all of them exactly,
+//! plus the original bytes for the few where it would not. `path_text` is
+//! therefore always populated and always queryable with `LIKE`; `path` is null
+//! unless the text form would lose something, which on a real machine is a
+//! handful of entries out of millions. Storing the bytes unconditionally doubled
+//! the size of a home-directory artifact and bought nothing.
 
 use rusqlite::{Connection, Transaction, params};
 use scrub_core::artifact::{ArtifactHeader, ArtifactKind, Digest, MachineScope, Stage};
@@ -35,7 +37,7 @@ CREATE TABLE header (
 ) STRICT;
 
 CREATE TABLE cloud_root (
-    path      BLOB NOT NULL,
+    path      BLOB,
     path_text TEXT NOT NULL,
     provider  TEXT NOT NULL,
     account   TEXT,
@@ -43,16 +45,16 @@ CREATE TABLE cloud_root (
 ) STRICT;
 
 CREATE TABLE cloud_link (
-    link        BLOB NOT NULL,
+    link        BLOB,
     link_text   TEXT NOT NULL,
-    target      BLOB NOT NULL,
+    target      BLOB,
     target_text TEXT NOT NULL,
     provider    TEXT NOT NULL,
     verdict     TEXT NOT NULL
 ) STRICT;
 
 CREATE TABLE entry (
-    path            BLOB    NOT NULL,
+    path            BLOB,
     path_text       TEXT    NOT NULL,
     kind            TEXT    NOT NULL,
     logical_size    INTEGER NOT NULL,
@@ -71,7 +73,7 @@ CREATE INDEX entry_by_path ON entry (path_text);
 CREATE INDEX entry_by_size ON entry (logical_size);
 
 CREATE TABLE unread (
-    path      BLOB NOT NULL,
+    path      BLOB,
     path_text TEXT NOT NULL,
     reason    TEXT NOT NULL
 ) STRICT;
@@ -106,7 +108,7 @@ pub fn write_all(transaction: &Transaction<'_>, inventory: &Inventory) -> Result
     for root in &inventory.detection.roots {
         let stored = StoredPath::of(&root.path);
         roots.execute(params![
-            stored.bytes,
+            exact_bytes(&stored),
             stored.display,
             to_json(&root.provider),
             root.account,
@@ -121,9 +123,9 @@ pub fn write_all(transaction: &Transaction<'_>, inventory: &Inventory) -> Result
         let from = StoredPath::of(&link.link);
         let to = StoredPath::of(&link.target);
         links.execute(params![
-            from.bytes,
+            exact_bytes(&from),
             from.display,
-            to.bytes,
+            exact_bytes(&to),
             to.display,
             to_json(&link.provider),
             to_json(&link.verdict),
@@ -138,7 +140,7 @@ pub fn write_all(transaction: &Transaction<'_>, inventory: &Inventory) -> Result
         let stored = StoredPath::of(&entry.path);
         let target = entry.link_target.as_ref().map(|path| StoredPath::of(path));
         entries.execute(params![
-            stored.bytes,
+            exact_bytes(&stored),
             stored.display,
             to_json(&entry.kind),
             store(entry.logical_size),
@@ -148,7 +150,7 @@ pub fn write_all(transaction: &Transaction<'_>, inventory: &Inventory) -> Result
             entry.file_id.map(|id| store(id.volume)),
             entry.file_id.map(|id| store(id.index)),
             store(entry.link_count),
-            target.as_ref().map(|stored| stored.bytes.clone()),
+            target.as_ref().and_then(exact_bytes),
             target.as_ref().map(|stored| stored.display.clone()),
             to_json(&entry.cloud),
         ])?;
@@ -159,7 +161,7 @@ pub fn write_all(transaction: &Transaction<'_>, inventory: &Inventory) -> Result
     for place in &inventory.outcome.unread {
         let stored = StoredPath::of(&place.path);
         unread.execute(params![
-            stored.bytes,
+            exact_bytes(&stored),
             stored.display,
             to_json(&place.reason)
         ])?;
@@ -227,7 +229,7 @@ fn read_roots(
     let roots = statement
         .query_map([], |row| {
             Ok((
-                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Option<Vec<u8>>>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, Option<String>>(3)?,
@@ -239,7 +241,7 @@ fn read_roots(
         .into_iter()
         .map(|(bytes, text, provider, account, origin)| {
             Ok(CloudRoot {
-                path: revive(&bytes, &text, path_encoding),
+                path: revive(bytes.as_deref(), &text, path_encoding),
                 provider: from_json::<Provider>("cloud_root.provider", &provider)?,
                 account,
                 origin: from_json("cloud_root.origin", &origin)?,
@@ -258,9 +260,9 @@ fn read_links(
     let links = statement
         .query_map([], |row| {
             Ok((
-                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Option<Vec<u8>>>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, Option<Vec<u8>>>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
                 row.get::<_, String>(5)?,
@@ -272,8 +274,8 @@ fn read_links(
         .map(
             |(link_bytes, link_text, target_bytes, target_text, provider, verdict)| {
                 Ok(ProviderLink {
-                    link: revive(&link_bytes, &link_text, path_encoding),
-                    target: revive(&target_bytes, &target_text, path_encoding),
+                    link: revive(link_bytes.as_deref(), &link_text, path_encoding),
+                    target: revive(target_bytes.as_deref(), &target_text, path_encoding),
                     provider: from_json::<Provider>("cloud_link.provider", &provider)?,
                     verdict: from_json::<LinkVerdict>("cloud_link.verdict", &verdict)?,
                 })
@@ -324,7 +326,7 @@ fn read_unread(
     let places = statement
         .query_map([], |row| {
             Ok((
-                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Option<Vec<u8>>>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
             ))
@@ -334,7 +336,7 @@ fn read_unread(
         .into_iter()
         .map(|(bytes, text, reason)| {
             Ok(Unread {
-                path: revive(&bytes, &text, path_encoding),
+                path: revive(bytes.as_deref(), &text, path_encoding),
                 reason: from_json::<UnreadReason>("unread.reason", &reason)?,
             })
         })
@@ -366,7 +368,7 @@ fn parse_digest(field: &'static str, text: &str) -> Result<Digest, StoreError> {
 
 /// One row of the entry table, before it becomes an [`Entry`].
 struct EntryRow {
-    path: Vec<u8>,
+    path: Option<Vec<u8>>,
     path_text: String,
     kind: String,
     logical_size: i64,
@@ -384,11 +386,11 @@ struct EntryRow {
 impl EntryRow {
     fn into_entry(self, encoding: PathEncoding) -> Result<Entry, StoreError> {
         let link_target = match (&self.link_target, &self.link_target_text) {
-            (Some(bytes), Some(text)) => Some(revive(bytes, text, encoding)),
-            _ => None,
+            (bytes, Some(text)) => Some(revive(bytes.as_deref(), text, encoding)),
+            (_, None) => None,
         };
         Ok(Entry {
-            path: revive(&self.path, &self.path_text, encoding),
+            path: revive(self.path.as_deref(), &self.path_text, encoding),
             kind: from_json::<EntryKind>("entry.kind", &self.kind)?,
             logical_size: load(self.logical_size),
             allocated_size: self.allocated_size.map(load),
@@ -416,7 +418,12 @@ impl EntryRow {
 /// Such an artifact can still be read, compared and displayed — which is all the
 /// merge stage needs, since identity comes from content and never from a path
 /// (DR-13).
-fn revive(bytes: &[u8], text: &str, encoding: PathEncoding) -> std::path::PathBuf {
+fn revive(bytes: Option<&[u8]>, text: &str, encoding: PathEncoding) -> std::path::PathBuf {
+    let Some(bytes) = bytes else {
+        // No bytes were kept, which means the text reproduces the path exactly.
+        // Anything else would have kept them.
+        return std::path::PathBuf::from(text);
+    };
     StoredPath {
         bytes: bytes.to_vec(),
         display: text.to_owned(),
@@ -438,6 +445,15 @@ fn parse_time(
                 })
         })
         .transpose()
+}
+
+/// The bytes to keep beside the text, or nothing when the text is exact.
+fn exact_bytes(stored: &StoredPath) -> Option<Vec<u8>> {
+    if stored.text_is_exact() {
+        None
+    } else {
+        Some(stored.bytes.clone())
+    }
 }
 
 /// SQLite stores signed 64-bit integers, and some of what we record — a Windows

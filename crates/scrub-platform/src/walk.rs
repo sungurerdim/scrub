@@ -24,19 +24,51 @@ use scrub_core::inventory::{Entry, EntryKind, ScanOutcome, Unread, UnreadReason}
 
 use crate::{ScanMode, classify, imp};
 
+/// How far a traversal has got.
+///
+/// Reported as it goes rather than at the end. A scan of a home directory takes
+/// minutes, and one that shows nothing until it finishes is indistinguishable
+/// from one that has hung.
+#[derive(Clone, Copy, Debug)]
+pub struct Progress<'a> {
+    /// The directory being read.
+    pub directory: &'a Path,
+    /// How many things have been recorded so far.
+    pub found: usize,
+    /// How many places could not be read so far.
+    pub unread: usize,
+}
+
 /// Walks `root`, recording metadata and reading nothing.
 ///
 /// Requires a [`ScanMode`] by reference: the only way to obtain one is
 /// [`crate::enter_read_only_scan_mode`], so traversal cannot begin without the
 /// platform having been asked to forbid downloads first.
 #[must_use]
-pub fn walk(root: &Path, map: &CloudMap, _mode: &ScanMode) -> ScanOutcome {
+pub fn walk(root: &Path, map: &CloudMap, mode: &ScanMode) -> ScanOutcome {
+    walk_reporting(root, map, mode, &mut |_| {})
+}
+
+/// Walks `root`, reporting progress as each directory is read.
+#[must_use]
+pub fn walk_reporting(
+    root: &Path,
+    map: &CloudMap,
+    _mode: &ScanMode,
+    report: &mut dyn FnMut(&Progress<'_>),
+) -> ScanOutcome {
     let mut outcome = ScanOutcome::default();
     let mut queue = VecDeque::from([root.to_path_buf()]);
 
     // Breadth-first with an explicit queue rather than recursion: a deep tree,
     // or a directory structure built to be deep, must not exhaust the stack.
     while let Some(directory) = queue.pop_front() {
+        report(&Progress {
+            directory: &directory,
+            found: outcome.entries.len(),
+            unread: outcome.unread.len(),
+        });
+
         let children = match read_children(&directory) {
             Ok(children) => children,
             Err(reason) => {

@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["crates/scrub-core", "crates/scrub-platform", "crates/scrub-store"]
+members = [
+    "crates/scrub-core",
+    "crates/scrub-platform",
+    "crates/scrub-store",
+    "crates/scrub-cli",
+]
 
 [workspace.package]
 version = "0.0.0"
@@ -19,6 +24,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 thiserror = "2.0.20"
 tempfile = "3.27.0"
+clap = { version = "4.6.6", features = ["derive"] }
 uuid = { version = "1.25.0", features = ["v4", "serde"] }
 jiff = { version = "0.2.35", features = ["serde"] }
 

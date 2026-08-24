@@ -79,6 +79,24 @@ pub fn content_digest(detection: &Detection, outcome: &ScanOutcome) -> Digest {
     Digest::of(hasher.finalize().as_bytes())
 }
 
+/// The digest of what a scan was asked to cover.
+///
+/// Recorded in the header so a later stage can tell that an artifact describes a
+/// different part of the disk than the one it expected, rather than silently
+/// treating a partial scan as a complete one.
+#[must_use]
+pub fn scope_digest(roots: &[std::path::PathBuf]) -> Digest {
+    let mut sorted: Vec<&std::path::PathBuf> = roots.iter().collect();
+    sorted.sort();
+
+    let mut hasher = Hasher::new();
+    section(&mut hasher, b"scope", sorted.len());
+    for root in sorted {
+        field(&mut hasher, &StoredPath::of(root).bytes);
+    }
+    Digest::of(hasher.finalize().as_bytes())
+}
+
 /// Marks the start of a collection and how many items follow.
 fn section(hasher: &mut Hasher, name: &[u8], count: usize) {
     field(hasher, name);

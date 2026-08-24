@@ -28,6 +28,14 @@ UNGUARDED_FS = re.compile(
 # platform layer.
 FS_ALLOWED_CRATES = {"scrub-platform"}
 
+# Integration tests build the trees they run against, which is direct filesystem
+# work by definition. Annotating every fixture line would be noise, and noise
+# teaches people to add the annotation reflexively, which is exactly how a guard
+# stops guarding. Tests are separately forbidden from touching real user data
+# (see CONTRIBUTING.md).
+def is_test_file(path: Path) -> bool:
+    return "tests" in path.relative_to(ROOT).parts
+
 # Escape hatch for lines that provably touch a path the tool itself owns — an
 # artifact file, a config file — rather than user data.
 EXEMPT = "DR-11-EXEMPT:"
@@ -53,14 +61,13 @@ def guard_filesystem_access() -> None:
     """DR-11: reads have no side effects, enforced by routing all access."""
     offences: list[str] = []
     for source in rust_sources():
-        if crate_of(source) in FS_ALLOWED_CRATES:
+        if crate_of(source) in FS_ALLOWED_CRATES or is_test_file(source):
             continue
         lines = source.read_text(encoding="utf-8").splitlines()
         for number, line in enumerate(lines, start=1):
             if not UNGUARDED_FS.search(line):
                 continue
-            preceding = lines[number - 2] if number >= 2 else ""
-            if EXEMPT in preceding or EXEMPT in line:
+            if EXEMPT in line or exempted_by_comment_above(lines, number):
                 continue
             relative = source.relative_to(ROOT)
             offences.append(f"  {relative}:{number}: {line.strip()}")
@@ -74,6 +81,24 @@ def guard_filesystem_access() -> None:
             f"    // {EXEMPT} <why this path is not user data>\n\n"
             + "\n".join(offences)
         )
+
+
+def exempted_by_comment_above(lines: list[str], number: int) -> bool:
+    """Whether the run of comment lines directly above carries the exemption.
+
+    Looks back through the whole comment block rather than at a single line: an
+    exemption worth granting usually needs a sentence to justify it, and a
+    sentence wraps.
+    """
+    index = number - 2
+    while index >= 0:
+        stripped = lines[index].strip()
+        if not stripped.startswith("//"):
+            return False
+        if EXEMPT in stripped:
+            return True
+        index -= 1
+    return False
 
 
 def guard_rule_references() -> None:

@@ -10,9 +10,10 @@ space, and lets you design a complete reorganization before a single file moves.
 It has no delete operation. It cannot overwrite a file. It never downloads a cloud
 file without asking. Every change it makes is reversible in one step.
 
-> **Status: early development.** Stage 1 of 7 — traversal works and records what
-> it finds; the inventory artifact is next. Nothing is releasable yet. See
-> [`docs/PIPELINE.md`](docs/PIPELINE.md) for the build order.
+> **Status: early development.** Stage 1 of 7 is complete: `scrub scan` records a
+> machine into an inventory artifact. Analysis, comparison and planning are next,
+> and nothing writes to your files yet. See [`docs/PIPELINE.md`](docs/PIPELINE.md)
+> for the build order.
 
 ---
 
@@ -75,6 +76,29 @@ the files. Someone can scan their own machine, send you the result, and you can
 design their reorganization on yours and send back a plan for them to apply.
 
 Full detail: [`docs/PIPELINE.md`](docs/PIPELINE.md).
+
+## Trying it
+
+```bash
+cargo build --release -p scrub-cli
+
+./target/release/scrub scan                    # your home directory
+./target/release/scrub scan ~/Documents -o docs.inventory
+./target/release/scrub inspect scan.inventory  # summarise an artifact
+./target/release/scrub export scan.inventory   # newline-delimited JSON
+```
+
+A scan opens no files and downloads nothing. On macOS it runs under a kernel
+policy that makes an accidental download fail rather than happen, and it says so
+if the system refuses to grant it.
+
+The artifact is an ordinary SQLite database, so you never have to take the
+summary's word for anything:
+
+```bash
+sqlite3 scan.inventory "SELECT path_text, logical_size FROM entry
+                        WHERE cloud LIKE '%remote%' ORDER BY logical_size DESC LIMIT 20;"
+```
 
 ## Platforms
 

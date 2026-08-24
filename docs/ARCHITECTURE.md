@@ -81,6 +81,22 @@ What matters more than raw speed at this stage is that results arrive
 progressively: a scan that shows nothing for two minutes is indistinguishable
 from one that has hung.
 
+## Artifact size
+
+Measured on the same home directory: **2,473,068 entries in a 1.09 GB
+inventory**, roughly 440 bytes an entry. Most of that is the path text, which in
+a tree full of dependency directories runs long.
+
+Storing each path's raw bytes alongside its text cost 22% on top of that and
+bought nothing on the machine measured, where **zero** of the 2.47 million paths
+needed them. The bytes are now kept only where the text form would lose
+something — see the storage module for why that case still has to be handled.
+
+Prefix compression would cut the remainder substantially, and is deliberately not
+done yet: it trades away some of how legible the file is to someone poking at it
+in a database browser, which is a promise (DR-3) rather than a nicety. The figure
+above is the baseline any such change has to beat by enough to be worth it.
+
 ## Stack
 
 Every version below was verified against its registry on 2026-08-24 and is pinned

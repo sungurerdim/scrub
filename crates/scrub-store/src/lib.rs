@@ -15,7 +15,7 @@
 mod canonical;
 mod schema;
 
-pub use canonical::content_digest;
+pub use canonical::{content_digest, scope_digest};
 
 use std::path::Path;
 

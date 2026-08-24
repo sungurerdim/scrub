@@ -54,6 +54,16 @@ impl StoredPath {
         }
     }
 
+    /// Whether the readable form reproduces the path exactly.
+    ///
+    /// True for almost every path anyone has. Storage uses this to keep the
+    /// bytes only for the ones where they carry information the text does not,
+    /// which on a real machine is a handful out of millions.
+    #[must_use]
+    pub fn text_is_exact(&self) -> bool {
+        encode(std::path::Path::new(&self.display)) == self.bytes
+    }
+
     /// Reconstructs the path, if this machine spells paths the same way.
     ///
     /// Returns `None` for a path recorded on a machine with a different
