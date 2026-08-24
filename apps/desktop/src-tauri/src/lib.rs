@@ -38,6 +38,7 @@ pub fn handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + 
         commands::analyze,
         commands::groups,
         commands::copies,
+        commands::survey,
         commands::browse,
         commands::arrange,
         commands::take_back,

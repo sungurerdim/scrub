@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "What the window is allowed to ask for. The thirteen commands below are the whole of it: each is one stage of the pipeline, one change to an arrangement that has not happened yet, or one question about an artifact. Nothing here reaches the filesystem except through the pipeline, which refuses to overwrite and never deletes. The dialog is how somebody chooses what to scan, and it grants nothing beyond returning the path they picked.",
+  "description": "What the window is allowed to ask for. The fourteen commands below are the whole of it: each is one stage of the pipeline, one change to an arrangement that has not happened yet, or one question about an artifact. Nothing here reaches the filesystem except through the pipeline, which refuses to overwrite and never deletes. The dialog is how somebody chooses what to scan, and it grants nothing beyond returning the path they picked.",
   "windows": [
     "main"
   ],
@@ -13,6 +13,7 @@
     "allow-analyze",
     "allow-groups",
     "allow-copies",
+    "allow-survey",
     "allow-browse",
     "allow-arrange",
     "allow-take-back",

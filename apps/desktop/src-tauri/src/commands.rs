@@ -147,6 +147,23 @@ pub fn scan<R: Runtime>(
     Ok(summary)
 }
 
+/// Where the space went, and what it went on.
+///
+/// Arithmetic over what the scan recorded: nothing is opened and nothing is
+/// downloaded. A file's kind is judged by its name, which is stated on the
+/// screen rather than implied, because the only thing that would settle it is
+/// reading every file (DR-15).
+///
+/// # Errors
+///
+/// Returns a message if nothing has been scanned in this session yet.
+#[tauri::command(async)]
+pub fn survey(state: State<'_, Shared>) -> Answer<view::Survey> {
+    let session = state.0.lock().map_err(|_| poisoned())?;
+    let entries = held(&session)?;
+    Ok(view::Survey::of(&scrub_core::survey::survey(entries)))
+}
+
 /// What is directly inside one folder.
 ///
 /// The tree is browsed a folder at a time rather than sent across whole: an

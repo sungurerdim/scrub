@@ -110,6 +110,38 @@ export interface Outcome {
  */
 export type Runner = <T>(work: () => Promise<T>, then: (result: T) => void) => void;
 
+export interface Kind {
+  name: string;
+  files: number;
+  bytes: number;
+  personal: boolean;
+}
+
+export interface Heavy {
+  path: string;
+  files: number;
+  bytes: number;
+}
+
+export interface Biggest {
+  entry: number;
+  path: string;
+  bytes: number;
+  local: boolean;
+  kind: string;
+}
+
+export interface Survey {
+  files: number;
+  bytes: number;
+  hereBytes: number;
+  cloudBytes: number;
+  cloudFiles: number;
+  kinds: Kind[];
+  folders: Heavy[];
+  largest: Biggest[];
+}
+
 export interface Item {
   entry: number;
   name: string;
@@ -171,6 +203,7 @@ export const analyze = (thorough: boolean) => invoke<Findings>("analyze", { thor
 export const groups = (offset: number, limit: number) =>
   invoke<GroupRow[]>("groups", { offset, limit });
 export const copies = (group: number) => invoke<Copy[]>("copies", { group });
+export const survey = () => invoke<Survey>("survey");
 export const browse = (under: string | null, offset: number, limit: number) =>
   invoke<Listing>("browse", { under, offset, limit });
 export const arrange = (edit: Edit) => invoke<Arranged>("arrange", { edit });

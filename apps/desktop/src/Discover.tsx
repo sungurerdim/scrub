@@ -10,6 +10,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import type { Beginning, Inventory, Runner } from "./api";
 import * as api from "./api";
 import * as format from "./format";
+import { Survey } from "./Survey";
 import { Button, Card, Figure, Nothing, Path } from "./parts";
 
 export function Discover({
@@ -130,6 +131,7 @@ export function Discover({
       </Card>
 
       {inventory && <Found inventory={inventory} />}
+      {inventory && <Survey busy={busy} run={run} />}
     </div>
   );
 }

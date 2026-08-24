@@ -94,7 +94,9 @@ pnpm tauri dev        # or `pnpm tauri build` for an application you can keep
 
 Four steps, in order. **Discover** says what this machine synchronises and,
 before any other number, which folders sit inside a cloud directory without
-being backed up. **Organize** finds what is duplicated, shows each set as one
+being backed up. It will also tell you where the space went: what kind of things
+are here, the folders holding the most, and the largest single files — with what
+is in the cloud counted apart from what is actually on the disk. **Organize** finds what is duplicated, shows each set as one
 row, and lets you choose which copy to keep. **Arrange** is a file browser where
 you make folders, rename things and move them about — and none of it touches a
 disk, so you can change your mind as many times as you like, or take the last
@@ -117,6 +119,7 @@ cargo build --release -p scrub-cli
 ./target/release/scrub apply scan.preflight       # carry it out
 ./target/release/scrub undo scan.journal          # put it all back
 
+./target/release/scrub survey scan.inventory      # where the space went
 ./target/release/scrub inspect scan.journal       # summarise any artifact
 ./target/release/scrub export scan.inventory      # newline-delimited JSON
 ```

@@ -13,6 +13,7 @@ const COMMANDS: &[&str] = &[
     "analyze",
     "groups",
     "copies",
+    "survey",
     "browse",
     "arrange",
     "take_back",

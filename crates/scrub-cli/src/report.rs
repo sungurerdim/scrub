@@ -166,6 +166,70 @@ impl scrub_run::Watch for Terminal {
     }
 }
 
+/// Prints where the space went.
+///
+/// Ordered the way somebody reads it: how much there is and where it lives,
+/// then what kind of thing it is, then the specific places to go and look.
+pub fn describe_survey(found: &scrub_core::survey::Survey) {
+    println!("\nWhere the space went");
+    println!("  {} on this disk", human_bytes(found.here.bytes));
+    if found.in_the_cloud.files > 0 {
+        println!(
+            "  {} in the cloud and not on this disk, across {} file(s)",
+            human_bytes(found.in_the_cloud.bytes),
+            found.in_the_cloud.files
+        );
+        println!("  The two are kept apart: added together they describe nothing.");
+    }
+
+    if found.kinds.is_empty() {
+        return;
+    }
+
+    println!("\nWhat kind of things are here");
+    println!("  Judged by each file's name, not by opening it.");
+    for (category, weight) in &found.kinds {
+        println!(
+            "  {:<16} {:>10}  {} file(s){}",
+            category.name(),
+            human_bytes(weight.bytes),
+            weight.files,
+            if category.is_personal() {
+                ""
+            } else {
+                "   (the machine's, not yours)"
+            }
+        );
+    }
+
+    if !found.folders.is_empty() {
+        println!("\nThe folders holding the most");
+        for folder in found.folders.iter().take(10) {
+            println!(
+                "  {:>10}  {}",
+                human_bytes(folder.weight.bytes),
+                folder.path.display()
+            );
+        }
+    }
+
+    if !found.largest.is_empty() {
+        println!("\nThe largest single files");
+        for large in found.largest.iter().take(10) {
+            println!(
+                "  {:>10}  {}{}",
+                human_bytes(large.bytes),
+                large.path.display(),
+                if large.local {
+                    ""
+                } else {
+                    "   (in the cloud, so setting it aside frees nothing here)"
+                }
+            );
+        }
+    }
+}
+
 /// Prints what an analysis concluded.
 pub fn describe_groups(analysis: &Analysis, written_to: Option<&Path>) {
     let exact: Vec<_> = analysis

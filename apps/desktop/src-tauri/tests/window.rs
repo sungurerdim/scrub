@@ -294,6 +294,73 @@ fn everything_can_be_rearranged_with_nothing_happening() {
 }
 
 #[test]
+fn the_survey_says_where_the_space_went_without_opening_anything() {
+    let tree = tempfile::tempdir().expect("a directory to scan");
+    let place = tempfile::tempdir().expect("a directory for artifacts");
+
+    let root = tree.path();
+    std::fs::create_dir_all(root.join("Filmler")).expect("mkdir");
+    std::fs::write(root.join("Filmler/uzun.mkv"), vec![0_u8; 40_000]).expect("write");
+    std::fs::write(root.join("vergi.pdf"), vec![0_u8; 500]).expect("write");
+    // Inside a machine place, so it belongs to the machine however it is named.
+    std::fs::create_dir_all(root.join("Library/Caches")).expect("mkdir");
+    std::fs::write(root.join("Library/Caches/thumb.png"), vec![0_u8; 100]).expect("write");
+
+    let app = application(place.path());
+    ask(&app, "begin", json!({})).expect("the first screen");
+    ask(&app, "scan", json!({ "roots": [root.to_string_lossy()] })).expect("a scan");
+
+    let found = ask(&app, "survey", json!({})).expect("a survey");
+    assert_eq!(found["files"], 3);
+
+    let kinds: Vec<&str> = found["kinds"]
+        .as_array()
+        .expect("an array")
+        .iter()
+        .map(|kind| kind["name"].as_str().expect("a name"))
+        .collect();
+    assert_eq!(
+        kinds[0], "video",
+        "largest first, because that is the order somebody acts in: {kinds:?}"
+    );
+    assert!(kinds.contains(&"documents"));
+
+    let machine_owned = found["kinds"]
+        .as_array()
+        .expect("an array")
+        .iter()
+        .find(|kind| kind["name"] == json!("system files"))
+        .expect("the cached image is the machine's");
+    assert_eq!(
+        machine_owned["personal"], false,
+        "an image inside a caches folder is not a photograph somebody took"
+    );
+
+    // The folder where the space actually divides is named, and the chain of
+    // folders above it holding the same bytes is not.
+    let folders: Vec<&str> = found["folders"]
+        .as_array()
+        .expect("an array")
+        .iter()
+        .map(|folder| folder["path"].as_str().expect("a path"))
+        .collect();
+    assert!(
+        folders.iter().any(|path| path.ends_with("Filmler")),
+        "the folder holding the film is named: {folders:?}"
+    );
+
+    let largest = &found["largest"][0];
+    assert!(
+        largest["path"]
+            .as_str()
+            .expect("a path")
+            .ends_with("uzun.mkv"),
+        "the biggest file is the one to look at first"
+    );
+    assert_eq!(largest["kind"], "video");
+}
+
+#[test]
 fn a_stage_asked_for_out_of_order_says_which_step_to_take() {
     let place = tempfile::tempdir().expect("a directory for artifacts");
     let app = application(place.path());

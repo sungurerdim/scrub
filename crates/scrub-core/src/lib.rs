@@ -20,6 +20,7 @@ pub mod merge;
 pub mod paths;
 pub mod plan;
 pub mod preflight;
+pub mod survey;
 
 pub use artifact::{
     ArtifactHeader, ArtifactKind, ChainError, Digest, MachineId, MachineScope, ParentRef,

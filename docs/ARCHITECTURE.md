@@ -60,6 +60,19 @@ it, then carry it out). Only the last one changes anything, and only after
 showing every step and asking in words that name the file count and the space
 involved.
 
+`scrub-core::survey` answers the question somebody opens the tool with: *my disk
+is full and I do not know why.* It is arithmetic over what the scan recorded —
+nothing is opened, nothing is downloaded. A file's kind is judged by its name and
+by where it sits, and that is said on the screen rather than implied: settling it
+properly would mean reading two million files, and reading the ones in the cloud
+would download them (DR-15).
+
+Two rules earn their place there. What is in the cloud is counted apart from what
+is on the disk, because adding them gives a number true of neither (DR-16). And a
+folder whose weight is entirely explained by one folder inside it is left out —
+otherwise the list is `/`, `/Users/me`, `/Users/me/projects` and
+`/Users/me/projects/one`, four rows saying one thing.
+
 Arranging is DR-9 made usable. `scrub-core::edit` holds a picture of the
 filesystem that changes are applied to one at a time, so each change sees the
 world the last one left: rename a folder, then move a file into it by its new

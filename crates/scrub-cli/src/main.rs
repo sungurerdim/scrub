@@ -130,6 +130,11 @@ enum Command {
         #[arg(long)]
         replace: bool,
     },
+    /// Say where the space went, and what it went on.
+    Survey {
+        /// The inventory or analysis to look over.
+        artifact: PathBuf,
+    },
     /// Summarise an artifact.
     Inspect {
         /// The artifact to read.
@@ -189,6 +194,7 @@ fn main() -> ExitCode {
             out,
             replace,
         } => merge(&analyses, &out, replace),
+        Command::Survey { artifact } => survey(&artifact),
         Command::Inspect { artifact } => inspect(&artifact),
         Command::Export { artifact, out } => export(&artifact, out.as_deref()),
     };
@@ -337,6 +343,12 @@ enum KeepRule {
     Newest,
     /// The one with the fewest directories above it.
     Shallowest,
+}
+
+fn survey(artifact: &Path) -> Result<(), scrub_run::RunError> {
+    let inventory = Inventory::read(artifact)?;
+    report::describe_survey(&scrub_core::survey::survey(&inventory.body.outcome.entries));
+    Ok(())
 }
 
 fn inspect(artifact: &Path) -> Result<(), scrub_run::RunError> {

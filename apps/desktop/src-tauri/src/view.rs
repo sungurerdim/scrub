@@ -284,6 +284,114 @@ pub struct StepVerdict {
     pub impediment: Option<String>,
 }
 
+/// Where the space went, and what it went on.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Survey {
+    /// How many files there are altogether, and how much they hold.
+    pub files: usize,
+    /// How much space they hold altogether.
+    pub bytes: u64,
+    /// What is on this disk.
+    pub here_bytes: u64,
+    /// What exists in the cloud and is not on this disk.
+    pub cloud_bytes: u64,
+    /// How many of those are in the cloud.
+    pub cloud_files: usize,
+    /// What kind of things there are, largest first.
+    pub kinds: Vec<Kind>,
+    /// The folders holding the most, largest first.
+    pub folders: Vec<Heavy>,
+    /// The largest files, largest first.
+    pub largest: Vec<Biggest>,
+}
+
+/// One kind of thing, and how much of it there is.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Kind {
+    /// What to call it.
+    pub name: String,
+    /// How many files.
+    pub files: usize,
+    /// How much space.
+    pub bytes: u64,
+    /// Whether this is somebody's own material rather than the machine's.
+    pub personal: bool,
+}
+
+/// One folder and everything below it.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Heavy {
+    /// Where it is.
+    pub path: String,
+    /// How many files it holds, counting everything nested inside.
+    pub files: usize,
+    /// How much space they hold.
+    pub bytes: u64,
+}
+
+/// One file worth naming.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Biggest {
+    /// Which entry of the inventory.
+    pub entry: usize,
+    /// Where it is.
+    pub path: String,
+    /// How much space it takes.
+    pub bytes: u64,
+    /// Whether its content is on this disk.
+    pub local: bool,
+    /// What it appears to be.
+    pub kind: String,
+}
+
+impl Survey {
+    /// Summarises a survey for the window.
+    #[must_use]
+    pub fn of(found: &scrub_core::survey::Survey) -> Self {
+        Self {
+            files: found.everything.files,
+            bytes: found.everything.bytes,
+            here_bytes: found.here.bytes,
+            cloud_bytes: found.in_the_cloud.bytes,
+            cloud_files: found.in_the_cloud.files,
+            kinds: found
+                .kinds
+                .iter()
+                .map(|(category, weight)| Kind {
+                    name: category.name().to_owned(),
+                    files: weight.files,
+                    bytes: weight.bytes,
+                    personal: category.is_personal(),
+                })
+                .collect(),
+            folders: found
+                .folders
+                .iter()
+                .map(|folder| Heavy {
+                    path: show(&folder.path),
+                    files: folder.weight.files,
+                    bytes: folder.weight.bytes,
+                })
+                .collect(),
+            largest: found
+                .largest
+                .iter()
+                .map(|large| Biggest {
+                    entry: large.entry,
+                    path: show(&large.path),
+                    bytes: large.bytes,
+                    local: large.local,
+                    kind: large.category.name().to_owned(),
+                })
+                .collect(),
+        }
+    }
+}
+
 /// One thing in a folder, as the browser shows it.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
