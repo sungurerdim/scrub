@@ -10,9 +10,9 @@ space, and lets you design a complete reorganization before a single file moves.
 It has no delete operation. It cannot overwrite a file. It never downloads a cloud
 file without asking. Every change it makes is reversible in one step.
 
-> **Status: early development.** Step 0 — artifact schemas and test fixtures.
-> Nothing is releasable yet. See [`docs/PIPELINE.md`](docs/PIPELINE.md) for the
-> build order.
+> **Status: early development.** Stage 1 of 7 — traversal works and records what
+> it finds; the inventory artifact is next. Nothing is releasable yet. See
+> [`docs/PIPELINE.md`](docs/PIPELINE.md) for the build order.
 
 ---
 

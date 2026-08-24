@@ -6,7 +6,7 @@
 //! developer's macOS machine, instead of only wherever a Windows runner exists.
 //! The bit values come from Microsoft's file attribute reference.
 
-use crate::{Residency, Retention};
+use scrub_core::cloud::{Residency, Retention};
 
 /// The file or directory is not fully present locally; reading fetches the rest.
 pub const RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;

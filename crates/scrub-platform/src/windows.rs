@@ -15,8 +15,10 @@
 use std::os::windows::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
+use crate::PlatformError;
 use crate::win_attributes;
-use crate::{CloudRoot, Detection, PlatformError, Provider, Residency, Retention, RootOrigin};
+use scrub_core::cloud::{CloudRoot, Detection, Provider, Residency, Retention, RootOrigin};
+use scrub_core::inventory::{FileId, UnreadReason};
 
 /// Proof that the process is running under the read-only scan policy.
 ///
@@ -107,4 +109,65 @@ pub fn detect(home: &Path) -> Result<Detection, PlatformError> {
         roots,
         links: Vec::new(),
     })
+}
+
+/// The space the file actually occupies on this disk.
+///
+/// # Known gap
+///
+/// Windows reports allocation size through `FILE_STANDARD_INFO`, which needs an
+/// open handle, and the standard library does not surface it from a path-based
+/// stat. Rather than derive a figure from logical size — which would count every
+/// cloud placeholder's full size as space that deleting it would return — this
+/// reports nothing, and the capacity figures under-report on Windows until it is
+/// implemented. Under-reporting is a disappointment; over-reporting is a lie
+/// (DR-16).
+pub fn allocated_size(_metadata: &std::fs::Metadata) -> Option<u64> {
+    None
+}
+
+/// The filesystem's identity for the object.
+///
+/// # Known gap
+///
+/// Windows exposes this through `FILE_ID_INFO`, which needs an open handle. The
+/// standard library's accessors for it are still unstable, and opening a handle
+/// has to be done with `FILE_FLAG_OPEN_NO_RECALL` and `FILE_FLAG_BACKUP_SEMANTICS`
+/// or the open itself hydrates the placeholder — the exact outcome this crate
+/// exists to prevent. That is not something to write blind on a machine that
+/// cannot run it, so it reports nothing until it can be implemented and verified
+/// on Windows.
+pub fn file_id(_metadata: &std::fs::Metadata) -> Option<FileId> {
+    None
+}
+
+/// How many names refer to these same bytes.
+///
+/// # Known gap
+///
+/// From the same structure as [`file_id`], and unavailable for the same reason.
+/// Reporting one name means hard links are not yet detected on Windows; since
+/// [`allocated_size`] also reports nothing there, no capacity figure is derived
+/// from either, so the gap under-reports rather than misleads.
+pub fn link_count(_metadata: &std::fs::Metadata) -> u64 {
+    1
+}
+
+/// Turns a traversal failure into the reason it will be reported under (DR-23).
+///
+/// # Known gap
+///
+/// Windows has a family of `ERROR_CLOUD_FILE_*` codes for exactly the situation
+/// macOS reports as `EDEADLK`, and a service that cannot hydrate receives one of
+/// them instead of a plain refusal. Those codes are not mapped here because they
+/// could not be verified on a Windows machine, and a wrong constant would file a
+/// cloud-only directory under "permission denied" — a reason that would send the
+/// user looking in entirely the wrong place. Until then such failures are
+/// reported verbatim under `Other`, which is honest if unhelpful.
+pub fn classify_io_error(error: &std::io::Error) -> UnreadReason {
+    match error.kind() {
+        std::io::ErrorKind::PermissionDenied => UnreadReason::PermissionDenied,
+        std::io::ErrorKind::NotFound => UnreadReason::Vanished,
+        _ => crate::walk::other_reason(error),
+    }
 }

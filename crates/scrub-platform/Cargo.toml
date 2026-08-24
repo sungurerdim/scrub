@@ -9,12 +9,16 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+scrub-core = { path = "../scrub-core" }
 serde.workspace = true
 thiserror.workspace = true
 
 # No platform binding crates. The two calls we need are declared directly, which
 # is a smaller surface than pulling in libc or windows-sys for three constants
 # and one function.
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

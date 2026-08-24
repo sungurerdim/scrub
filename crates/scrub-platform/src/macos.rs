@@ -15,10 +15,17 @@ use std::ffi::{CString, c_char, c_int, c_void};
 use std::os::macos::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
-use crate::{
-    CloudRoot, Detection, LinkVerdict, PlatformError, Provider, ProviderLink, Residency, Retention,
-    RootOrigin,
+use crate::PlatformError;
+use scrub_core::cloud::{
+    CloudRoot, Detection, LinkVerdict, Provider, ProviderLink, Residency, Retention, RootOrigin,
 };
+use scrub_core::inventory::{FileId, UnreadReason};
+
+/// `sys/errno.h`: "Resource deadlock avoided", reported for a dataless object
+/// when this process forbids materialization.
+const EDEADLK: i32 = 11;
+/// `sys/errno.h`: "Operation timed out", reported when materialization failed.
+const ETIMEDOUT: i32 = 60;
 
 /// `sys/stat.h`: "file is dataless object".
 const SF_DATALESS: u32 = 0x4000_0000;
@@ -440,6 +447,64 @@ fn directory_name(path: &Path) -> String {
         .unwrap_or_default()
         .to_string_lossy()
         .into_owned()
+}
+
+/// The space the file actually occupies on this disk.
+///
+/// Wrapped in `Option` because the answer is genuinely unavailable on Windows
+/// without opening the file; the shape is a cross-platform contract, not
+/// indecision here.
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the Option is part of the cross-platform contract"
+)]
+///
+/// `st_blocks` counts 512-byte units regardless of the filesystem's own block
+/// size, which is what makes a dataless placeholder report zero while claiming a
+/// full logical size.
+pub fn allocated_size(metadata: &std::fs::Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt as _;
+    Some(metadata.blocks() * 512)
+}
+
+/// The filesystem's identity for the object.
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the Option is part of the cross-platform contract"
+)]
+pub fn file_id(metadata: &std::fs::Metadata) -> Option<FileId> {
+    use std::os::unix::fs::MetadataExt as _;
+    Some(FileId {
+        volume: metadata.dev(),
+        index: metadata.ino(),
+    })
+}
+
+/// How many names refer to these same bytes.
+pub fn link_count(metadata: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt as _;
+    metadata.nlink()
+}
+
+/// Turns a traversal failure into the reason it will be reported under (DR-23).
+pub fn classify_io_error(error: &std::io::Error) -> UnreadReason {
+    // Checked before the portable kinds: the standard library has no category
+    // for "this would have to be downloaded", and both of these arrive as
+    // ordinary errors that would otherwise be filed under "other".
+    // `EDEADLK` is documented by open(2) and read(2) for a dataless object when
+    // the process forbids materialization — exactly the mode every read-only
+    // stage runs under. `ETIMEDOUT` is documented by read(2) for a
+    // materialization that failed temporarily. Either way the content is not
+    // here, and getting it would cost a download.
+    if let Some(EDEADLK | ETIMEDOUT) = error.raw_os_error() {
+        return UnreadReason::WouldRequireDownload;
+    }
+
+    match error.kind() {
+        std::io::ErrorKind::PermissionDenied => UnreadReason::PermissionDenied,
+        std::io::ErrorKind::NotFound => UnreadReason::Vanished,
+        _ => crate::walk::other_reason(error),
+    }
 }
 
 #[cfg(test)]

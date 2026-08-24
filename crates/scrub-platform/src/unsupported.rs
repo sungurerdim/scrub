@@ -11,7 +11,9 @@
 
 use std::path::Path;
 
-use crate::{Detection, PlatformError, Residency, Retention};
+use crate::PlatformError;
+use scrub_core::cloud::{Detection, Residency, Retention};
+use scrub_core::inventory::{FileId, UnreadReason};
 
 /// Never constructed on this platform.
 #[derive(Debug)]
@@ -48,4 +50,24 @@ pub fn retention(_metadata: &std::fs::Metadata) -> Retention {
 /// Always returns [`PlatformError::Unsupported`].
 pub fn detect(_home: &Path) -> Result<Detection, PlatformError> {
     Err(PlatformError::Unsupported)
+}
+
+/// Reports nothing, on a platform where traversal never starts.
+pub fn allocated_size(_metadata: &std::fs::Metadata) -> Option<u64> {
+    None
+}
+
+/// Reports nothing, on a platform where traversal never starts.
+pub fn file_id(_metadata: &std::fs::Metadata) -> Option<FileId> {
+    None
+}
+
+/// Reports a single name, on a platform where traversal never starts.
+pub fn link_count(_metadata: &std::fs::Metadata) -> u64 {
+    1
+}
+
+/// Reports the error verbatim, on a platform where traversal never starts.
+pub fn classify_io_error(error: &std::io::Error) -> UnreadReason {
+    crate::walk::other_reason(error)
 }

@@ -46,6 +46,29 @@ Both implementations answer the same questions: which provider owns this path, i
 the content present locally, is it pinned, and what does the provider believe about
 it. Both are covered by the same fixture-driven tests.
 
+## Traversal
+
+Breadth-first, single-threaded, driven by an explicit queue rather than recursion
+so that a deep tree cannot exhaust the stack. Every fact comes from a
+symlink-preserving stat; nothing is opened.
+
+**Measured baseline**, macOS on Apple silicon, warm cache: a home directory of
+**2,459,990 entries in 131 seconds** — about 18,700 entries per second — of which
+253,628 were directories and **39,978 were symbolic links**. That last figure is
+the argument for DR-22 in a single number: a traversal that followed links would
+be counting most of this tree many times over, and would not finish at all on the
+first cycle it met.
+
+Traversal is not parallel yet, and that is a decision rather than an omission.
+The analyze stage reads file content and will dominate wall-clock time by a wide
+margin, so parallelising the walk first would optimise the cheaper half. It also
+has no baseline to be measured against until the whole pipeline exists. The
+number above is that baseline, recorded so a future change has to prove itself.
+
+What matters more than raw speed at this stage is that results arrive
+progressively: a scan that shows nothing for two minutes is indistinguishable
+from one that has hung.
+
 ## Stack
 
 Every version below was verified against its registry on 2026-08-24 and is pinned

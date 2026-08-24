@@ -11,6 +11,8 @@
 #![forbid(unsafe_code)]
 
 pub mod artifact;
+pub mod cloud;
+pub mod inventory;
 
 pub use artifact::{
     ArtifactHeader, ArtifactKind, ChainError, Digest, MachineId, MachineScope, ParentRef,
