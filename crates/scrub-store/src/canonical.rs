@@ -31,7 +31,45 @@ pub fn plan_digest(body: &Body, operations: &[scrub_core::plan::Operation]) -> D
     for operation in operations {
         json(&mut hasher, operation);
     }
-    Digest::of(hasher.finalize().as_bytes())
+    Digest::from_bytes(*hasher.finalize().as_bytes())
+}
+
+/// The digest of a preflight.
+#[must_use]
+pub fn preflight_digest(
+    body: &Body,
+    operations: &[scrub_core::plan::Operation],
+    verdicts: &[scrub_core::preflight::Verdict],
+) -> Digest {
+    let mut hasher = Hasher::new();
+    field(
+        &mut hasher,
+        plan_digest(body, operations).to_hex().as_bytes(),
+    );
+    section(&mut hasher, b"verdicts", verdicts.len());
+    for verdict in verdicts {
+        json(&mut hasher, verdict);
+    }
+    Digest::from_bytes(*hasher.finalize().as_bytes())
+}
+
+/// The digest of a run.
+#[must_use]
+pub fn journal_digest(
+    body: &Body,
+    operations: &[scrub_core::plan::Operation],
+    steps: &[scrub_core::journal::Step],
+) -> Digest {
+    let mut hasher = Hasher::new();
+    field(
+        &mut hasher,
+        plan_digest(body, operations).to_hex().as_bytes(),
+    );
+    section(&mut hasher, b"steps", steps.len());
+    for step in steps {
+        json(&mut hasher, step);
+    }
+    Digest::from_bytes(*hasher.finalize().as_bytes())
 }
 
 /// The digest of an artifact's content.
@@ -55,7 +93,7 @@ pub fn analysis_digest(
         number(&mut hasher, *index as u64);
         json(&mut hasher, state);
     }
-    Digest::of(hasher.finalize().as_bytes())
+    Digest::from_bytes(*hasher.finalize().as_bytes())
 }
 
 /// The digest of an artifact's content.
@@ -141,7 +179,7 @@ pub fn content_digest(body: &Body, groups: &[Group]) -> Digest {
         json(&mut hasher, group);
     }
 
-    Digest::of(hasher.finalize().as_bytes())
+    Digest::from_bytes(*hasher.finalize().as_bytes())
 }
 
 /// The digest of what a scan was asked to cover.
@@ -159,7 +197,7 @@ pub fn scope_digest(roots: &[std::path::PathBuf]) -> Digest {
     for root in sorted {
         field(&mut hasher, &StoredPath::of(root).bytes);
     }
-    Digest::of(hasher.finalize().as_bytes())
+    Digest::from_bytes(*hasher.finalize().as_bytes())
 }
 
 /// Marks the start of a collection and how many items follow.

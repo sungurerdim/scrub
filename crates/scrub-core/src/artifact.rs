@@ -25,7 +25,9 @@ use uuid::Uuid;
 /// - 1 — first shape.
 /// - 2 — path bytes stored only where the text form is inexact; the digest
 ///   covers analysis groups as well as the scan body.
-pub const SCHEMA_VERSION: u32 = 2;
+/// - 3 — a file's content digest is the plain BLAKE3 of its content rather than
+///   a digest of a digest, so `b3sum` agrees with what the tool reports.
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// A BLAKE3-256 digest.
 ///
@@ -46,6 +48,18 @@ impl Digest {
     #[must_use]
     pub fn of(bytes: &[u8]) -> Self {
         Self(*blake3::hash(bytes).as_bytes())
+    }
+
+    /// Takes a digest that has already been computed.
+    ///
+    /// Used where content was hashed in pieces rather than all at once. Hashing
+    /// the result a second time would work just as well internally and would
+    /// make every digest the tool reports unverifiable from outside: a file's
+    /// digest is the plain BLAKE3 of its content, so `b3sum` agrees with us and
+    /// anybody can check a claim we make about their file.
+    #[must_use]
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
     }
 
     /// The digest as lowercase hexadecimal.

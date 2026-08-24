@@ -533,3 +533,49 @@ fn a_plan_edited_after_writing_is_refused() {
         "an operation removed behind the tool's back must be caught"
     );
 }
+
+#[test]
+fn the_canonical_form_has_not_changed_without_anybody_noticing() {
+    // A guard rather than an assertion about correctness. Any change to how a
+    // digest is taken silently invalidates every artifact already written, and
+    // the only thing that tells an older artifact apart from a tampered one is
+    // the schema version. Forgetting to bump it turns an ordinary upgrade into
+    // the most alarming message the tool has.
+    //
+    // If this fails, the canonical form changed. That may be entirely right —
+    // but it means SCHEMA_VERSION must go up in the same commit, and this value
+    // must be replaced with the new one.
+    let body = Body {
+        path_encoding: scrub_core::paths::PathEncoding::Bytes,
+        detection: Detection::default(),
+        outcome: ScanOutcome {
+            entries: vec![Entry {
+                path: PathBuf::from("/pinned/example.txt"),
+                kind: EntryKind::File,
+                logical_size: 1_234,
+                allocated_size: Some(4_096),
+                created: None,
+                modified: None,
+                file_id: Some(FileId {
+                    volume: 7,
+                    index: 99,
+                }),
+                link_count: 1,
+                link_target: None,
+                cloud: CloudState::not_synced(),
+            }],
+            unread: Vec::new(),
+        },
+    };
+
+    assert_eq!(
+        scrub_store::content_digest(&body, &[]).to_hex(),
+        "dd19ac7ca31234935091259130cb97ffe9e39eb6d6a5ab5867f9399704d91a14",
+        "the canonical form changed — bump SCHEMA_VERSION and update this value"
+    );
+    assert_eq!(
+        scrub_core::artifact::SCHEMA_VERSION,
+        3,
+        "the pinned digest above belongs to this schema version"
+    );
+}

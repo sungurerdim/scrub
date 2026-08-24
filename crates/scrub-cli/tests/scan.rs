@@ -702,3 +702,156 @@ fn a_plan_cannot_be_made_from_a_comparison() {
         "planning from a comparison is refused"
     );
 }
+
+/// Runs the whole pipeline over a tree and returns the artifacts it produced.
+struct Pipeline {
+    tree: tempfile::TempDir,
+    workspace: tempfile::TempDir,
+}
+
+impl Pipeline {
+    fn run(tree: tempfile::TempDir) -> Self {
+        let workspace = workspace();
+        let pipeline = Self { tree, workspace };
+
+        pipeline.step(
+            &["scan", "--quiet", "--out"],
+            "scan.inventory",
+            Some("TREE"),
+        );
+        pipeline.step(
+            &["analyze", "--quiet", "--out"],
+            "scan.analysis",
+            Some("scan.inventory"),
+        );
+        pipeline.step(&["plan", "--out"], "scan.plan", Some("scan.analysis"));
+        pipeline.step(&["preflight", "--out"], "scan.preflight", Some("scan.plan"));
+        pipeline
+    }
+
+    fn at(&self, name: &str) -> PathBuf {
+        self.workspace.path().join(name)
+    }
+
+    fn step(&self, args: &[&str], out: &str, input: Option<&str>) -> String {
+        let mut command = scrub();
+        command.args(args).arg(self.at(out));
+        match input {
+            Some("TREE") => {
+                command.arg(self.tree.path());
+            }
+            Some(name) => {
+                command.arg(self.at(name));
+            }
+            None => {}
+        }
+        let output = command.output().expect("the stage must run");
+        assert!(
+            output.status.success(),
+            "{args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    fn files(&self) -> Vec<(PathBuf, Vec<u8>)> {
+        tree_state(self.tree.path())
+    }
+}
+
+#[test]
+fn a_run_sets_files_aside_and_undoing_puts_every_one_back() {
+    // The promise the whole tool is built on, end to end: after a run and its
+    // reversal the tree is byte-identical to how it started (DR-10).
+    let pipeline = Pipeline::run(original_and_copies());
+    let before = pipeline.files();
+
+    let applied = pipeline.step(&["apply", "--out"], "scan.journal", Some("scan.preflight"));
+    assert!(applied.contains("change(s) made"), "{applied}");
+
+    let after_apply = pipeline.files();
+    assert_ne!(before, after_apply, "the run did something");
+    assert!(
+        after_apply.len() < before.len(),
+        "and what it did was take files out of the tree"
+    );
+
+    let reversed = pipeline.step(&["undo", "--out"], "undo.journal", Some("scan.journal"));
+    assert!(reversed.contains("put back where they were"), "{reversed}");
+
+    assert_eq!(
+        before,
+        pipeline.files(),
+        "every file is back, with its content unchanged"
+    );
+}
+
+#[test]
+fn nothing_a_run_sets_aside_is_deleted() {
+    // DR-5, checked by finding the files again rather than by trusting the
+    // wording. Quarantine is a place, and everything is still in it.
+    let pipeline = Pipeline::run(original_and_copies());
+    let before = pipeline.files();
+
+    pipeline.step(&["apply", "--out"], "scan.journal", Some("scan.preflight"));
+
+    let quarantine = pipeline.at("scan.quarantine");
+    assert!(quarantine.exists(), "the quarantine directory was made");
+
+    let held = tree_state(&quarantine);
+    assert!(!held.is_empty(), "and it holds what left the tree");
+
+    let remaining: Vec<Vec<u8>> = pipeline
+        .files()
+        .into_iter()
+        .map(|(_, content)| content)
+        .collect();
+    for (_, content) in &before {
+        let still_somewhere = remaining.contains(content)
+            || held.iter().any(|(_, quarantined)| quarantined == content);
+        assert!(
+            still_somewhere,
+            "every file that existed before is still somewhere"
+        );
+    }
+}
+
+#[test]
+fn a_journal_records_where_everything_went() {
+    // What makes undo a matter of reading rather than of remembering.
+    let pipeline = Pipeline::run(original_and_copies());
+    pipeline.step(&["apply", "--out"], "scan.journal", Some("scan.preflight"));
+
+    let inspected = scrub()
+        .arg("inspect")
+        .arg(pipeline.at("scan.journal"))
+        .output()
+        .expect("inspect must run");
+    assert!(inspected.status.success());
+
+    let text = String::from_utf8_lossy(&inspected.stdout);
+    assert!(text.contains("Run"), "the stage is reported: {text}");
+    assert!(text.contains("change(s) made"), "and what it did: {text}");
+}
+
+#[test]
+fn a_file_changed_between_checking_and_running_is_left_alone() {
+    // The last guard, and the one hardest to test any other way: preflight
+    // passed, then somebody edited the file. Setting it aside now would set
+    // aside work nobody accounted for (DR-8).
+    let pipeline = Pipeline::run(original_and_copies());
+
+    let copy = pipeline.tree.path().join("Desktop/old/tax-copy.pdf");
+    fs::write(&copy, b"edited after preflight said it was fine").expect("edit");
+
+    let applied = pipeline.step(&["apply", "--out"], "scan.journal", Some("scan.preflight"));
+    assert!(
+        applied.contains("left alone because something had changed"),
+        "the edit is noticed and acted on: {applied}"
+    );
+    assert_eq!(
+        fs::read(&copy).expect("read"),
+        b"edited after preflight said it was fine",
+        "and the edited file is exactly where it was"
+    );
+}

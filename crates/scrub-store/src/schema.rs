@@ -17,8 +17,10 @@ use scrub_core::analysis::{Group, Settled, StorageObject};
 use scrub_core::artifact::{ArtifactHeader, ArtifactKind, Digest, MachineScope, Stage};
 use scrub_core::cloud::{CloudRoot, CloudState, Detection, LinkVerdict, Provider, ProviderLink};
 use scrub_core::inventory::{Entry, EntryKind, FileId, ScanOutcome, Unread, UnreadReason};
+use scrub_core::journal::Step;
 use scrub_core::paths::{PathEncoding, StoredPath};
 use scrub_core::plan::Operation;
+use scrub_core::preflight::Verdict;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -317,6 +319,94 @@ pub fn read_operations(connection: &Connection) -> Result<Vec<Operation>, StoreE
         .collect()
 }
 
+/// Records one step, before or after it is attempted.
+///
+/// Written one at a time rather than in a batch at the end. A run that stops
+/// part-way has to leave a record of where it stopped, and a record written only
+/// on success is no record at all (DR-7).
+pub fn write_step(connection: &Connection, sequence: usize, step: &Step) -> Result<(), StoreError> {
+    connection.execute(
+        "INSERT OR REPLACE INTO step VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            store(sequence as u64),
+            store(step.operation as u64),
+            to_json(&step.progress),
+            step.from.display().to_string(),
+            step.to.as_ref().map(|path| path.display().to_string()),
+            step.content.map(Digest::to_hex),
+            step.at.to_string(),
+            to_json(step),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Reads a run's steps back, in the order they were recorded.
+pub fn read_steps(connection: &Connection) -> Result<Vec<Step>, StoreError> {
+    let mut statement = connection.prepare("SELECT detail FROM step ORDER BY sequence")?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    rows.iter()
+        .map(|detail| from_json::<Step>("step.detail", detail))
+        .collect()
+}
+
+/// Marks a run as having finished, by writing the digest of what it did.
+pub fn finalize(connection: &Connection, digest: Digest) -> Result<(), StoreError> {
+    connection.execute(
+        "UPDATE header SET content_digest = ?1",
+        params![digest.to_hex()],
+    )?;
+    Ok(())
+}
+
+/// Writes a preflight's verdicts.
+pub fn write_verdicts(
+    transaction: &Transaction<'_>,
+    verdicts: &[Verdict],
+) -> Result<(), StoreError> {
+    let mut statement = transaction.prepare("INSERT INTO verdict VALUES (?1, ?2, ?3, ?4)")?;
+    for verdict in verdicts {
+        statement.execute(params![
+            store(verdict.operation as u64),
+            to_json(&verdict.grade),
+            to_json(&verdict.rigour),
+            verdict.impediment.as_ref().map(to_json),
+        ])?;
+    }
+    Ok(())
+}
+
+/// Reads a preflight's verdicts back.
+pub fn read_verdicts(connection: &Connection) -> Result<Vec<Verdict>, StoreError> {
+    let mut statement = connection
+        .prepare("SELECT operation, grade, rigour, impediment FROM verdict ORDER BY operation")?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    rows.into_iter()
+        .map(|(operation, grade, rigour, impediment)| {
+            Ok(Verdict {
+                operation: usize::try_from(load(operation)).unwrap_or(0),
+                grade: from_json("verdict.grade", &grade)?,
+                rigour: from_json("verdict.rigour", &rigour)?,
+                impediment: impediment
+                    .map(|text| from_json("verdict.impediment", &text))
+                    .transpose()?,
+            })
+        })
+        .collect()
+}
+
 /// Writes what reading established about each entry.
 pub fn write_settled(
     transaction: &Transaction<'_>,
@@ -592,6 +682,24 @@ CREATE TABLE operation (
     destination    TEXT,
     frees_bytes    INTEGER NOT NULL,
     detail         TEXT    NOT NULL
+) STRICT;
+
+CREATE TABLE verdict (
+    operation   INTEGER NOT NULL PRIMARY KEY,
+    grade       TEXT    NOT NULL,
+    rigour      TEXT    NOT NULL,
+    impediment  TEXT
+) STRICT;
+
+CREATE TABLE step (
+    sequence   INTEGER NOT NULL PRIMARY KEY,
+    operation  INTEGER NOT NULL,
+    progress   TEXT    NOT NULL,
+    from_path  TEXT    NOT NULL,
+    to_path    TEXT,
+    content    TEXT,
+    at         TEXT    NOT NULL,
+    detail     TEXT    NOT NULL
 ) STRICT;
 
 CREATE TABLE settled (

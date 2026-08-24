@@ -10,11 +10,11 @@ space, and lets you design a complete reorganization before a single file moves.
 It has no delete operation. It cannot overwrite a file. It never downloads a cloud
 file without asking. Every change it makes is reversible in one step.
 
-> **Status: early development.** Phase 1 is complete — stages 1 to 4 of 7.
-> `scan` records a machine, `analyze` works out what is the same file as what,
-> `merge` compares two machines, and `plan` decides what should happen. **Nothing
-> writes to your files, at any stage, by design.** The write path is Phase 2. See
-> [`docs/PIPELINE.md`](docs/PIPELINE.md) for the build order.
+> **Status: early development.** All seven stages work end to end — scan,
+> analyze, merge, plan, preflight, apply, undo — and a run followed by its
+> reversal leaves the tree byte-identical. There is no interface yet beyond the
+> command line, and it has been exercised on macOS only. See
+> [`docs/PIPELINE.md`](docs/PIPELINE.md) for what each stage does.
 
 ---
 
@@ -86,7 +86,11 @@ cargo build --release -p scrub-cli
 ./target/release/scrub scan                       # your home directory
 ./target/release/scrub analyze scan.inventory     # what is the same as what
 ./target/release/scrub plan scan.analysis         # what should happen about it
-./target/release/scrub inspect scan.plan          # summarise an artifact
+./target/release/scrub preflight scan.plan        # check it, changing nothing
+./target/release/scrub apply scan.preflight       # carry it out
+./target/release/scrub undo scan.journal          # put it all back
+
+./target/release/scrub inspect scan.journal       # summarise any artifact
 ./target/release/scrub export scan.inventory      # newline-delimited JSON
 ```
 
@@ -158,6 +162,28 @@ Plan
 Conflicts — two files wanting the same destination, or a destination already
 occupied — are found here, while the plan is still a document. Not at operation
 four hundred with three hundred and ninety-nine already done.
+
+Then preflight checks the plan against the disk, reading every file again and
+writing nothing, and grades each operation on its own. Only what passed is
+carried out, each change recorded before it is attempted:
+
+```
+Run
+  Finished.
+
+  2 change(s) made, freeing 8.1 kB
+
+  Everything set aside is in:
+    scan.quarantine
+  Nothing has been deleted. It stays there until you empty it.
+
+  To put it all back:  scrub undo scan.journal
+```
+
+`scrub undo` uses the same machinery in reverse, so undo is ordinary rather than
+a recovery mode with its own bugs. It refuses to put a file back on top of
+something that has taken its name since, and it leaves alone any folder somebody
+has used in the meantime.
 
 ## Platforms
 

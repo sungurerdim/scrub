@@ -13,6 +13,7 @@ scrub-core = { path = "../scrub-core" }
 blake3.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+jiff.workspace = true
 
 # No platform binding crates. The two calls we need are declared directly, which
 # is a smaller surface than pulling in libc or windows-sys for three constants

@@ -15,7 +15,9 @@
 mod canonical;
 mod schema;
 
-pub use canonical::{analysis_digest, content_digest, plan_digest, scope_digest};
+pub use canonical::{
+    analysis_digest, content_digest, journal_digest, plan_digest, preflight_digest, scope_digest,
+};
 
 use std::path::Path;
 
@@ -26,8 +28,10 @@ use scrub_core::analysis::{Group, Settled};
 use scrub_core::artifact::{ArtifactHeader, Digest};
 use scrub_core::cloud::Detection;
 use scrub_core::inventory::ScanOutcome;
+use scrub_core::journal::Step;
 use scrub_core::paths::PathEncoding;
 use scrub_core::plan::Operation;
+use scrub_core::preflight::Verdict;
 
 /// What a scan found, without regard to which artifact carries it.
 ///
@@ -299,6 +303,233 @@ impl Plan {
             });
         }
         Ok(plan)
+    }
+}
+
+/// A preflight artifact: a plan, and what checking it against the disk found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Preflight {
+    /// Where this artifact sits in the chain.
+    pub header: ArtifactHeader,
+    /// What the scan found, carried forward intact.
+    pub body: Body,
+    /// What the plan says should happen.
+    pub operations: Vec<Operation>,
+    /// What checking each operation found.
+    pub verdicts: Vec<Verdict>,
+}
+
+impl Preflight {
+    /// The digest of this artifact's content, in canonical form.
+    #[must_use]
+    pub fn content_digest(&self) -> Digest {
+        canonical::preflight_digest(&self.body, &self.operations, &self.verdicts)
+    }
+
+    /// Whether these paths can be acted on by this machine.
+    #[must_use]
+    pub fn is_native(&self) -> bool {
+        self.body.is_native()
+    }
+
+    /// How the verdicts came out.
+    #[must_use]
+    pub fn standing(&self) -> scrub_core::preflight::Standing {
+        scrub_core::preflight::standing(&self.verdicts)
+    }
+
+    /// The operations that will run, in plan order.
+    #[must_use]
+    pub fn passing(&self) -> Vec<usize> {
+        scrub_core::preflight::passing(&self.verdicts)
+    }
+
+    /// Writes the artifact.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::AlreadyThere`] if the path is occupied and
+    /// `replace` is false.
+    pub fn write(&self, path: &Path, replace: Replace) -> Result<(), StoreError> {
+        let mut connection = open_for_writing(path, replace)?;
+        schema::create(&connection)?;
+        schema::create_groups(&connection)?;
+        let transaction = connection.transaction()?;
+        schema::write_body(&transaction, &self.header, &self.body)?;
+        schema::write_operations(&transaction, &self.body.outcome.entries, &self.operations)?;
+        schema::write_verdicts(&transaction, &self.verdicts)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Reads a preflight.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::ContentAltered`] if the recorded digest does not
+    /// match the content. That check matters more here than anywhere: this is
+    /// the artifact that decides what is allowed to touch a user's files.
+    pub fn read(path: &Path) -> Result<Self, StoreError> {
+        // DR-11-EXEMPT: the tool's own artifact, never a path from a scan.
+        let connection = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        let (header, body) = schema::read_body(&connection)?;
+        check_schema(&header)?;
+        let preflight = Self {
+            header,
+            body,
+            operations: schema::read_operations(&connection)?,
+            verdicts: schema::read_verdicts(&connection)?,
+        };
+
+        let actual = preflight.content_digest();
+        if actual != preflight.header.content_digest {
+            return Err(StoreError::ContentAltered {
+                recorded: preflight.header.content_digest,
+                found: actual,
+            });
+        }
+        Ok(preflight)
+    }
+}
+
+/// A journal artifact: a run, recorded as it happened.
+///
+/// The only artifact written a piece at a time. Every other one is produced
+/// whole and then stored; this one has to survive the process being killed
+/// halfway through, so each step is written as it is attempted and the header is
+/// completed at the end (DR-7).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Journal {
+    /// Where this artifact sits in the chain.
+    pub header: ArtifactHeader,
+    /// What the scan found, carried forward intact.
+    pub body: Body,
+    /// What the plan said should happen.
+    pub operations: Vec<Operation>,
+    /// What actually happened, in the order it happened.
+    pub steps: Vec<Step>,
+    /// Whether the run reached its end.
+    ///
+    /// A journal that was never finished describes a run that stopped part-way.
+    /// It is still complete enough to undo, which is the point of writing each
+    /// step as it is attempted.
+    pub finished: bool,
+}
+
+/// The digest an unfinished run carries until it finishes.
+const UNFINISHED: [u8; 32] = [0; 32];
+
+impl Journal {
+    /// The digest of what this run did.
+    #[must_use]
+    pub fn content_digest(&self) -> Digest {
+        canonical::journal_digest(&self.body, &self.operations, &self.steps)
+    }
+
+    /// Whether these paths can be acted on by this machine.
+    #[must_use]
+    pub fn is_native(&self) -> bool {
+        self.body.is_native()
+    }
+
+    /// How the run came out.
+    #[must_use]
+    pub fn tally(&self) -> scrub_core::journal::Tally {
+        let entries = &self.body.outcome.entries;
+        let operations = &self.operations;
+        scrub_core::journal::tally(&self.steps, |step| {
+            operations
+                .get(step.operation)
+                .map_or(0, |operation| operation.frees(entries))
+        })
+    }
+
+    /// Starts a journal, on disk, before anything is done.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::AlreadyThere`] if the path is occupied and
+    /// `replace` is false.
+    pub fn begin(
+        path: &Path,
+        header: &ArtifactHeader,
+        body: &Body,
+        operations: &[Operation],
+        replace: Replace,
+    ) -> Result<Connection, StoreError> {
+        let mut connection = open_for_writing(path, replace)?;
+        schema::create(&connection)?;
+        schema::create_groups(&connection)?;
+
+        let mut opening = header.clone();
+        opening.content_digest = Digest::from_bytes(UNFINISHED);
+
+        let transaction = connection.transaction()?;
+        schema::write_body(&transaction, &opening, body)?;
+        schema::write_operations(&transaction, &body.outcome.entries, operations)?;
+        transaction.commit()?;
+        Ok(connection)
+    }
+
+    /// Records one step as it is attempted.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying storage error.
+    pub fn record(connection: &Connection, sequence: usize, step: &Step) -> Result<(), StoreError> {
+        schema::write_step(connection, sequence, step)
+    }
+
+    /// Marks a run as having finished.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying storage error.
+    pub fn finish(connection: &Connection, digest: Digest) -> Result<(), StoreError> {
+        schema::finalize(connection, digest)
+    }
+
+    /// Reads a run back.
+    ///
+    /// An unfinished run is returned rather than refused: it describes changes
+    /// that were made, and refusing to read it would leave them with no way back
+    /// (DR-10).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::ContentAltered`] if a finished run's record no
+    /// longer matches its digest.
+    pub fn read(path: &Path) -> Result<Self, StoreError> {
+        // DR-11-EXEMPT: the tool's own artifact, never a path from a scan.
+        let connection = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        let (header, body) = schema::read_body(&connection)?;
+        check_schema(&header)?;
+
+        let finished = header.content_digest != Digest::from_bytes(UNFINISHED);
+        let journal = Self {
+            header,
+            body,
+            operations: schema::read_operations(&connection)?,
+            steps: schema::read_steps(&connection)?,
+            finished,
+        };
+
+        if finished {
+            let actual = journal.content_digest();
+            if actual != journal.header.content_digest {
+                return Err(StoreError::ContentAltered {
+                    recorded: journal.header.content_digest,
+                    found: actual,
+                });
+            }
+        }
+        Ok(journal)
     }
 }
 

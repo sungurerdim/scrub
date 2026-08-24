@@ -669,6 +669,182 @@ fn describe_rule(rule: &Keep) -> String {
     }
 }
 
+/// Prints what checking a plan against the disk found.
+///
+/// Written to be read before anything happens, because that is the only moment
+/// it is useful. Every operation is accounted for: what will run, what will not,
+/// and why (DR-19, DR-23).
+pub fn describe_preflight(checked: &scrub_store::Preflight, written_to: Option<&Path>) {
+    use scrub_core::preflight::{Grade, Impediment, Rigour};
+
+    let standing = checked.standing();
+    let rigour = checked
+        .verdicts
+        .first()
+        .map_or(Rigour::Content, |verdict| verdict.rigour);
+
+    println!("\nPreflight");
+    println!(
+        "  {}",
+        match rigour {
+            Rigour::Content => "Every file was read again and compared with the plan.",
+            Rigour::Metadata => "Sizes and timestamps were compared; content was not read again.",
+        }
+    );
+    println!("  Nothing has been touched. This is what would run.");
+
+    println!(
+        "\n  {} of {} operation(s) will run",
+        standing.passing,
+        standing.total()
+    );
+    if standing.is_clear() {
+        println!("  Everything the plan asked for still checks out.");
+    } else {
+        println!(
+            "  {} held back, {} cannot proceed",
+            standing.held, standing.failed
+        );
+    }
+
+    // Grouped by what stands in the way, because the answer to "what do I do
+    // about this" is the same for everything sharing a reason.
+    let mut reasons: std::collections::BTreeMap<String, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for verdict in &checked.verdicts {
+        if verdict.grade == Grade::Pass {
+            continue;
+        }
+        let Some(impediment) = &verdict.impediment else {
+            continue;
+        };
+        reasons
+            .entry(explain_impediment(impediment).to_owned())
+            .or_default()
+            .push(verdict.operation);
+    }
+
+    for (reason, operations) in &reasons {
+        println!("\n  {} — {reason}", operations.len());
+        for index in operations.iter().take(3) {
+            if let Some(subject) = checked
+                .operations
+                .get(*index)
+                .and_then(scrub_core::plan::Operation::subject)
+            {
+                println!("    {}", subject.path.display());
+            }
+        }
+        if operations.len() > 3 {
+            println!("    … and {} more", operations.len() - 3);
+        }
+    }
+
+    if !standing.is_clear() {
+        println!("\n  Held operations are questions, not failures. Re-plan to settle them.");
+    }
+
+    if let Some(path) = written_to {
+        println!("\nWritten to {}", path.display());
+        println!("  content digest {}", checked.header.content_digest);
+        println!("  Still nothing on disk has been touched.");
+    }
+
+    let _ = Impediment::SourceMissing;
+}
+
+fn explain_impediment(impediment: &scrub_core::preflight::Impediment) -> &'static str {
+    use scrub_core::preflight::Impediment;
+    match impediment {
+        Impediment::SourceMissing => "the file is no longer where the plan found it",
+        Impediment::SourceChanged { .. } => "the file changed after the plan was made",
+        Impediment::DestinationOccupied => "something is already at the destination",
+        Impediment::DestinationUnreachable => "the destination's folder does not exist",
+        Impediment::PermissionDenied => "the system refused access",
+        Impediment::ContentNotPresent => "the content is in the cloud, not on this machine",
+        Impediment::Other(_) => "the system reported a problem",
+    }
+}
+
+/// Prints what a run actually did.
+///
+/// The only report in the tool written in the past tense, and it says where
+/// everything went, because the next thing somebody wants to know after a run is
+/// how to undo it (DR-10).
+pub fn describe_run(run: &scrub_store::Journal, artifact: &Path, quarantine: Option<&Path>) {
+    use scrub_core::journal::Progress;
+
+    let tally = run.tally();
+    let reversing = run.header.stage == scrub_core::artifact::Stage::Undo;
+
+    println!("\nRun");
+    if run.finished {
+        println!("  Finished.");
+    } else {
+        println!("  Stopped before the end. Everything it did get to is recorded below,");
+        println!("  and can be put back.");
+    }
+
+    // A reversal moves files back rather than away, so it frees nothing. Saying
+    // it did would be the kind of small lie that makes someone stop trusting the
+    // larger numbers.
+    if reversing {
+        println!("\n  {} file(s) put back where they were", tally.done);
+    } else {
+        println!(
+            "\n  {} change(s) made, freeing {}",
+            tally.done,
+            human_bytes(tally.freed)
+        );
+    }
+    if tally.skipped > 0 {
+        println!(
+            "  {} left alone because something had changed since checking",
+            tally.skipped
+        );
+    }
+    if tally.failed > 0 {
+        println!("  {} could not be carried out", tally.failed);
+    }
+    if tally.unresolved > 0 {
+        println!(
+            "  {} written down but never resolved — the run stopped at that point",
+            tally.unresolved
+        );
+    }
+
+    // Grouped by reason, since the answer to "what now" is the same for
+    // everything that stopped for the same cause.
+    let mut reasons: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for step in &run.steps {
+        match &step.progress {
+            Progress::Skipped(impediment) => {
+                *reasons
+                    .entry(explain_impediment(impediment).to_owned())
+                    .or_default() += 1;
+            }
+            Progress::Failed(detail) => {
+                *reasons.entry(detail.clone()).or_default() += 1;
+            }
+            Progress::Done | Progress::Intended => {}
+        }
+    }
+    for (reason, count) in &reasons {
+        println!("    {count} — {reason}");
+    }
+
+    if let Some(root) = quarantine {
+        println!("\n  Everything set aside is in:");
+        println!("    {}", root.display());
+        println!("  Nothing has been deleted. It stays there until you empty it.");
+    }
+
+    println!("\n  Recorded in {}", artifact.display());
+    if tally.done > 0 && !reversing {
+        println!("  To put it all back:  scrub undo {}", artifact.display());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::human_bytes;

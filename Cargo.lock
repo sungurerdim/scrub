@@ -553,6 +553,7 @@ name = "scrub-platform"
 version = "0.0.0"
 dependencies = [
  "blake3",
+ "jiff",
  "scrub-core",
  "serde",
  "tempfile",

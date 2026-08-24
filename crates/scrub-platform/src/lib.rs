@@ -18,6 +18,8 @@ pub use scrub_core::cloud::{
 };
 
 pub mod digest;
+pub mod execute;
+pub mod verify;
 pub mod walk;
 pub mod win_attributes;
 

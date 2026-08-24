@@ -79,6 +79,46 @@ enum Command {
         #[arg(long)]
         replace: bool,
     },
+    /// Check a plan against the disk, changing nothing.
+    Preflight {
+        /// The plan to check.
+        plan: PathBuf,
+        /// Where to write the result.
+        #[arg(short, long, default_value = "scan.preflight")]
+        out: PathBuf,
+        /// Compare sizes and timestamps instead of reading content again.
+        ///
+        /// Much faster, and enough to catch anything an ordinary edit would do.
+        /// It cannot catch a file swapped for another of the same size with its
+        /// timestamp preserved.
+        #[arg(long)]
+        fast: bool,
+        /// Write over an artifact already at that path.
+        #[arg(long)]
+        replace: bool,
+    },
+    /// Carry out the operations a preflight passed.
+    Apply {
+        /// The preflight to carry out.
+        preflight: PathBuf,
+        /// Where to write the record of the run.
+        #[arg(short, long, default_value = "scan.journal")]
+        out: PathBuf,
+        /// Write over an artifact already at that path.
+        #[arg(long)]
+        replace: bool,
+    },
+    /// Put everything a run moved back where it was.
+    Undo {
+        /// The record of the run to reverse.
+        journal: PathBuf,
+        /// Where to write the record of the reversal.
+        #[arg(short, long, default_value = "undo.journal")]
+        out: PathBuf,
+        /// Write over an artifact already at that path.
+        #[arg(long)]
+        replace: bool,
+    },
     /// Compare two or more machines' analyses side by side.
     Merge {
         /// The analyses to combine. Each file's name becomes its label.
@@ -128,6 +168,22 @@ fn main() -> ExitCode {
             out,
             replace,
         } => plan(&analysis, keep, prefer, &out, replace),
+        Command::Preflight {
+            plan,
+            out,
+            fast,
+            replace,
+        } => preflight(&plan, &out, fast, replace),
+        Command::Apply {
+            preflight,
+            out,
+            replace,
+        } => apply(&preflight, &out, replace),
+        Command::Undo {
+            journal,
+            out,
+            replace,
+        } => undo(&journal, &out, replace),
         Command::Merge {
             analyses,
             out,
@@ -301,6 +357,214 @@ fn analyze(
     Ok(())
 }
 
+fn apply(
+    preflight_path: &std::path::Path,
+    out: &std::path::Path,
+    replace: bool,
+) -> Result<(), String> {
+    check_output_is_free(out, replace)?;
+
+    // Reading content is part of the last check before each move, so the same
+    // guard every other stage starts under applies here too (DR-11).
+    let mode = scrub_platform::enter_read_only_scan_mode().map_err(|error| error.to_string())?;
+
+    let checked = scrub_store::Preflight::read(preflight_path)
+        .map_err(|error| format!("could not read {}: {error}", preflight_path.display()))?;
+    scrub_core::artifact::verify_executable_here(&checked.header, machine::identity()?)
+        .map_err(|error| error.to_string())?;
+
+    let running = checked.passing();
+    if running.is_empty() {
+        return Err(
+            "nothing passed preflight, so there is nothing to carry out. \
+             Re-plan to settle what was held back."
+                .to_owned(),
+        );
+    }
+
+    let quarantine =
+        scrub_platform::execute::Quarantine::at(scrub_platform::verify::quarantine_beside(out))
+            .map_err(|error| format!("could not prepare the quarantine directory: {error}"))?;
+
+    let home = home_directory()?;
+    let map = scrub_platform::detect_cloud_map(&home).map_err(|error| error.to_string())?;
+
+    let header = header_for(
+        Stage::Apply,
+        vec![checked.header.content_digest],
+        checked.header.scope_digest,
+        scrub_core::artifact::Digest::of(b"placeholder"),
+    )?;
+
+    // Opened before anything is done, so a run that is killed halfway through
+    // leaves a record of where it got to (DR-7).
+    let connection = scrub_store::Journal::begin(
+        out,
+        &header,
+        &checked.body,
+        &checked.operations,
+        replacement(replace),
+    )
+    .map_err(|error| error.to_string())?;
+
+    println!("Carrying out {} operation(s).", running.len());
+    println!("  Quarantine: {}", quarantine.root().display());
+
+    let mut steps = Vec::with_capacity(running.len());
+    for (sequence, index) in running.iter().enumerate() {
+        let Some(operation) = checked.operations.get(*index) else {
+            continue;
+        };
+
+        // Written down before it is attempted. A crash between these two lines
+        // leaves a step marked as intended, which a later run can settle by
+        // looking rather than by guessing.
+        let intended = scrub_core::journal::Step {
+            operation: *index,
+            progress: scrub_core::journal::Progress::Intended,
+            from: operation
+                .subject()
+                .map_or_else(PathBuf::new, |subject| subject.path.clone()),
+            to: None,
+            content: operation.subject().and_then(|subject| subject.content),
+            at: jiff::Timestamp::now(),
+        };
+        scrub_store::Journal::record(&connection, sequence, &intended)
+            .map_err(|error| error.to_string())?;
+
+        let step = scrub_platform::execute::perform(*index, operation, &quarantine, &map, &mode);
+        scrub_store::Journal::record(&connection, sequence, &step)
+            .map_err(|error| error.to_string())?;
+        steps.push(step);
+    }
+
+    let digest = scrub_store::journal_digest(&checked.body, &checked.operations, &steps);
+    scrub_store::Journal::finish(&connection, digest).map_err(|error| error.to_string())?;
+    drop(connection);
+
+    let journal = scrub_store::Journal::read(out).map_err(|error| error.to_string())?;
+    report::describe_run(&journal, out, Some(quarantine.root()));
+    Ok(())
+}
+
+fn undo(
+    journal_path: &std::path::Path,
+    out: &std::path::Path,
+    replace: bool,
+) -> Result<(), String> {
+    check_output_is_free(out, replace)?;
+    let mode = scrub_platform::enter_read_only_scan_mode().map_err(|error| error.to_string())?;
+
+    let done = scrub_store::Journal::read(journal_path)
+        .map_err(|error| format!("could not read {}: {error}", journal_path.display()))?;
+    scrub_core::artifact::verify_executable_here(&done.header, machine::identity()?)
+        .map_err(|error| error.to_string())?;
+
+    if !done.finished {
+        println!("This run did not reach its end. Reversing what it did get to.");
+    }
+
+    let order = scrub_core::journal::reversal_order(&done.steps);
+    if order.is_empty() {
+        return Err("this run changed nothing, so there is nothing to put back".to_owned());
+    }
+
+    let home = home_directory()?;
+    let map = scrub_platform::detect_cloud_map(&home).map_err(|error| error.to_string())?;
+
+    let header = header_for(
+        Stage::Undo,
+        vec![done.header.content_digest],
+        done.header.scope_digest,
+        scrub_core::artifact::Digest::of(b"placeholder"),
+    )?;
+    let connection = scrub_store::Journal::begin(
+        out,
+        &header,
+        &done.body,
+        &done.operations,
+        replacement(replace),
+    )
+    .map_err(|error| error.to_string())?;
+
+    println!("Putting {} file(s) back.", order.len());
+
+    let mut steps = Vec::with_capacity(order.len());
+    for (sequence, index) in order.iter().enumerate() {
+        let step = scrub_platform::execute::reverse(*index, &done.steps[*index], &map, &mode);
+        scrub_store::Journal::record(&connection, sequence, &step)
+            .map_err(|error| error.to_string())?;
+        steps.push(step);
+    }
+
+    let digest = scrub_store::journal_digest(&done.body, &done.operations, &steps);
+    scrub_store::Journal::finish(&connection, digest).map_err(|error| error.to_string())?;
+    drop(connection);
+
+    let reversed = scrub_store::Journal::read(out).map_err(|error| error.to_string())?;
+    report::describe_run(&reversed, out, None);
+    Ok(())
+}
+
+fn preflight(
+    plan_path: &std::path::Path,
+    out: &std::path::Path,
+    fast: bool,
+    replace: bool,
+) -> Result<(), String> {
+    check_output_is_free(out, replace)?;
+
+    // Checking reads content, so the same guard every reading stage starts
+    // under applies here too (DR-11).
+    let mode = scrub_platform::enter_read_only_scan_mode().map_err(|error| error.to_string())?;
+
+    let drafted = scrub_store::Plan::read(plan_path)
+        .map_err(|error| format!("could not read {}: {error}", plan_path.display()))?;
+
+    // A plan made for another machine names paths that mean something else here
+    // (DR-18).
+    scrub_core::artifact::verify_executable_here(&drafted.header, machine::identity()?)
+        .map_err(|error| error.to_string())?;
+
+    let rigour = if fast {
+        scrub_core::preflight::Rigour::Metadata
+    } else {
+        scrub_core::preflight::Rigour::Content
+    };
+
+    let home = home_directory()?;
+    let map = scrub_platform::detect_cloud_map(&home).map_err(|error| error.to_string())?;
+
+    let verdicts = scrub_platform::verify::verify(
+        &drafted.operations,
+        &drafted.body.outcome.entries,
+        &map,
+        rigour,
+        &mode,
+    );
+
+    let parent = drafted.header.content_digest;
+    let mut checked = scrub_store::Preflight {
+        header: header_for(
+            Stage::Preflight,
+            vec![parent],
+            drafted.header.scope_digest,
+            scrub_core::artifact::Digest::of(b"placeholder"),
+        )?,
+        body: drafted.body,
+        operations: drafted.operations,
+        verdicts,
+    };
+    checked.header.content_digest = checked.content_digest();
+
+    checked
+        .write(out, replacement(replace))
+        .map_err(|error| error.to_string())?;
+
+    report::describe_preflight(&checked, Some(out));
+    Ok(())
+}
+
 /// Which copy of a duplicated file to keep.
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 enum KeepRule {
@@ -469,6 +733,22 @@ fn label_for(path: &std::path::Path) -> String {
 fn inspect(artifact: &std::path::Path) -> Result<(), String> {
     // Each artifact is the one before it with more in it, so trying the richest
     // first tells us which we were handed without asking the caller to say.
+    if let Ok(run) = scrub_store::Journal::read(artifact)
+        && matches!(run.header.stage, Stage::Apply | Stage::Undo)
+    {
+        report::describe_header(&run.header, run.is_native());
+        report::describe_run(&run, artifact, None);
+        return Ok(());
+    }
+
+    if let Ok(checked) = scrub_store::Preflight::read(artifact)
+        && checked.header.stage == Stage::Preflight
+    {
+        report::describe_header(&checked.header, checked.is_native());
+        report::describe_preflight(&checked, None);
+        return Ok(());
+    }
+
     if let Ok(drafted) = scrub_store::Plan::read(artifact)
         && drafted.header.stage == Stage::Plan
     {

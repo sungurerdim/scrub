@@ -97,7 +97,7 @@ pub fn quick_digest(
         .map_err(|error| refusal(&error))?;
     hasher.update(&tail);
 
-    Ok(Digest::of(hasher.finalize().as_bytes()))
+    Ok(Digest::from_bytes(*hasher.finalize().as_bytes()))
 }
 
 /// A digest of a file's entire content.
@@ -125,7 +125,7 @@ pub fn full_digest(
         hasher.update(&buffer[..read]);
     }
 
-    Ok(Digest::of(hasher.finalize().as_bytes()))
+    Ok(Digest::from_bytes(*hasher.finalize().as_bytes()))
 }
 
 /// Opens a file, but only if its content is already here.
@@ -301,6 +301,22 @@ mod tests {
         assert_ne!(
             quick_digest(&one, &local(), 19, &mode).expect("digest"),
             quick_digest(&two, &local(), 19, &mode).expect("digest")
+        );
+    }
+
+    #[test]
+    fn a_content_digest_is_the_plain_blake3_of_the_file() {
+        // So that anyone can check a claim the tool makes about their own file
+        // with an ordinary command, rather than taking our word for it.
+        let mode = crate::enter_read_only_scan_mode().expect("scan mode");
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let content = b"exactly what b3sum would be given";
+        let path = write(directory.path(), "file", content);
+
+        assert_eq!(
+            full_digest(&path, &local(), content.len() as u64, &mode).expect("digest"),
+            Digest::of(content),
+            "a file's digest must be the BLAKE3 of its content and nothing else"
         );
     }
 

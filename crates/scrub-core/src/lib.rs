@@ -14,9 +14,11 @@ pub mod analysis;
 pub mod artifact;
 pub mod cloud;
 pub mod inventory;
+pub mod journal;
 pub mod merge;
 pub mod paths;
 pub mod plan;
+pub mod preflight;
 
 pub use artifact::{
     ArtifactHeader, ArtifactKind, ChainError, Digest, MachineId, MachineScope, ParentRef,
