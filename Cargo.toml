@@ -1,0 +1,35 @@
+[workspace]
+resolver = "3"
+members = ["crates/scrub-core"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.98"
+license = "Apache-2.0"
+repository = "https://github.com/sungurerdim/scrub"
+authors = ["The scrub Authors"]
+
+# Every version here was verified against crates.io on 2026-08-24 and is pinned
+# deliberately. Upgrades are a reviewed change, not a side effect (DR-12).
+[workspace.dependencies]
+blake3 = "1.8.7"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.20"
+uuid = { version = "1.25.0", features = ["v4", "serde"] }
+jiff = { version = "0.2.35", features = ["serde"] }
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"

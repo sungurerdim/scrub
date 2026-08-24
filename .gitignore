@@ -1,0 +1,23 @@
+/target
+**/node_modules
+/apps/desktop/dist
+/apps/desktop/src-tauri/target
+
+# Generated test fixture trees — never committed, always regenerated (CONTRIBUTING.md)
+/fixtures/generated
+
+# Artifacts produced by running the tool. These describe a real person's storage
+# and must never enter version control (SECURITY.md).
+*.inventory
+*.analysis
+*.plan
+*.preflight
+*.journal
+*.inventory.ndjson
+*.analysis.ndjson
+*.plan.ndjson
+*.preflight.ndjson
+*.journal.ndjson
+
+.DS_Store
+Thumbs.db
