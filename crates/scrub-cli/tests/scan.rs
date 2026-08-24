@@ -1,6 +1,7 @@
 //! The command line, end to end, against a tree built for the occasion.
 
 use std::fs;
+use std::path::PathBuf;
 use std::process::Command;
 
 fn scrub() -> Command {
@@ -310,4 +311,186 @@ impl StatusOk for std::process::ExitStatus {
     fn status_ok(&self) -> bool {
         self.success()
     }
+}
+
+/// Two trees standing in for two machines: one file in both, one in each alone.
+fn two_machines() -> (tempfile::TempDir, tempfile::TempDir) {
+    let first = tempfile::tempdir().expect("a temporary directory");
+    let second = tempfile::tempdir().expect("a temporary directory");
+
+    // The same content under different names, which is the ordinary case: a
+    // document copied between machines rarely keeps its path.
+    fs::write(first.path().join("tax.pdf"), b"the 2026 return").expect("write");
+    fs::write(second.path().join("tax-copy.pdf"), b"the 2026 return").expect("write");
+
+    fs::write(first.path().join("only-here.txt"), b"first machine").expect("write");
+    fs::write(second.path().join("only-there.txt"), b"second machine").expect("write");
+
+    (first, second)
+}
+
+fn analysis_of(tree: &std::path::Path, workspace: &std::path::Path, name: &str) -> PathBuf {
+    let inventory = workspace.join(format!("{name}.inventory"));
+    let analysis = workspace.join(format!("{name}.analysis"));
+
+    assert!(
+        scrub()
+            .args(["scan", "--quiet", "--out"])
+            .arg(&inventory)
+            .arg(tree)
+            .status()
+            .expect("scan")
+            .success()
+    );
+    assert!(
+        scrub()
+            .args(["analyze", "--quiet", "--thorough", "--out"])
+            .arg(&analysis)
+            .arg(&inventory)
+            .status()
+            .expect("analyze")
+            .success()
+    );
+    analysis
+}
+
+#[test]
+fn a_comparison_separates_what_is_in_both_places_from_what_is_in_one() {
+    // The question the tool was built for. Both halves have to be right: a file
+    // wrongly called shared invites deleting the only copy, and one wrongly
+    // called exclusive sends someone looking for a backup that exists.
+    let (first, second) = two_machines();
+    let elsewhere = workspace();
+    let one = analysis_of(first.path(), elsewhere.path(), "mac");
+    let two = analysis_of(second.path(), elsewhere.path(), "windows");
+
+    let output = scrub()
+        .arg("merge")
+        .arg(&one)
+        .arg(&two)
+        .args(["--out"])
+        .arg(elsewhere.path().join("combined.analysis"))
+        .output()
+        .expect("merge must run");
+    assert!(
+        output.status.success(),
+        "merge failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        text.contains("1 file(s), 15 bytes of content"),
+        "the shared file is found despite its different name: {text}"
+    );
+    assert!(
+        text.contains("mac                  1 file(s)")
+            && text.contains("windows              1 file(s)"),
+        "each machine has exactly one file the other lacks: {text}"
+    );
+}
+
+#[test]
+fn a_comparison_says_what_it_did_not_cover() {
+    // Without --thorough a file whose size nothing on its own machine shares is
+    // never read, so it cannot be recognised anywhere. Saying so is the
+    // difference between a partial answer and a wrong one (DR-23).
+    let (first, second) = two_machines();
+    let elsewhere = workspace();
+
+    let mut analyses = Vec::new();
+    for (tree, name) in [(first.path(), "mac"), (second.path(), "windows")] {
+        let inventory = elsewhere.path().join(format!("{name}.inventory"));
+        let analysis = elsewhere.path().join(format!("{name}.analysis"));
+        assert!(
+            scrub()
+                .args(["scan", "--quiet", "--out"])
+                .arg(&inventory)
+                .arg(tree)
+                .status()
+                .expect("scan")
+                .success()
+        );
+        // Deliberately not thorough.
+        assert!(
+            scrub()
+                .args(["analyze", "--quiet", "--out"])
+                .arg(&analysis)
+                .arg(&inventory)
+                .status()
+                .expect("analyze")
+                .success()
+        );
+        analyses.push(analysis);
+    }
+
+    let output = scrub()
+        .arg("merge")
+        .args(&analyses)
+        .args(["--out"])
+        .arg(elsewhere.path().join("combined.analysis"))
+        .output()
+        .expect("merge must run");
+    assert!(output.status.success());
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        text.contains("--thorough"),
+        "an incomplete comparison must say so and say what to do: {text}"
+    );
+}
+
+#[test]
+fn a_comparison_cannot_be_applied_anywhere() {
+    // It describes several machines, so no single machine is the one it is
+    // about (DR-18). Anything downstream must refuse it rather than pick one.
+    let (first, second) = two_machines();
+    let elsewhere = workspace();
+    let one = analysis_of(first.path(), elsewhere.path(), "mac");
+    let two = analysis_of(second.path(), elsewhere.path(), "windows");
+    let combined = elsewhere.path().join("combined.analysis");
+
+    assert!(
+        scrub()
+            .arg("merge")
+            .arg(&one)
+            .arg(&two)
+            .args(["--out"])
+            .arg(&combined)
+            .status()
+            .expect("merge")
+            .success()
+    );
+
+    let again = scrub()
+        .arg("merge")
+        .arg(&combined)
+        .arg(&one)
+        .args(["--out"])
+        .arg(elsewhere.path().join("twice.analysis"))
+        .output()
+        .expect("the second merge must run");
+    assert!(
+        !again.status.success(),
+        "merging a comparison back in would count a machine twice"
+    );
+}
+
+#[test]
+fn merging_a_single_analysis_is_refused() {
+    let (first, _second) = two_machines();
+    let elsewhere = workspace();
+    let one = analysis_of(first.path(), elsewhere.path(), "mac");
+
+    let output = scrub()
+        .arg("merge")
+        .arg(&one)
+        .args(["--out"])
+        .arg(elsewhere.path().join("combined.analysis"))
+        .output()
+        .expect("merge must run");
+    assert!(
+        !output.status.success(),
+        "one analysis is not a comparison of anything"
+    );
 }

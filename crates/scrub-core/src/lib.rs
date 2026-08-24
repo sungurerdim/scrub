@@ -14,6 +14,7 @@ pub mod analysis;
 pub mod artifact;
 pub mod cloud;
 pub mod inventory;
+pub mod merge;
 pub mod paths;
 
 pub use artifact::{

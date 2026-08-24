@@ -54,6 +54,24 @@ enum Command {
         /// Write over an artifact already at that path.
         #[arg(long)]
         replace: bool,
+        /// Read every file, not only those that could be local duplicates.
+        ///
+        /// Needed before comparing this machine with another: a file whose size
+        /// nothing here shares is never read otherwise, and without a
+        /// fingerprint it cannot be recognised on the other machine.
+        #[arg(long)]
+        thorough: bool,
+    },
+    /// Compare two or more machines' analyses side by side.
+    Merge {
+        /// The analyses to combine. Each file's name becomes its label.
+        analyses: Vec<PathBuf>,
+        /// Where to write the combined view.
+        #[arg(short, long, default_value = "combined.analysis")]
+        out: PathBuf,
+        /// Write over an artifact already at that path.
+        #[arg(long)]
+        replace: bool,
     },
     /// Summarise an artifact.
     Inspect {
@@ -84,7 +102,13 @@ fn main() -> ExitCode {
             out,
             quiet,
             replace,
-        } => analyze(&inventory, &out, quiet, replace),
+            thorough,
+        } => analyze(&inventory, &out, quiet, replace, thorough),
+        Command::Merge {
+            analyses,
+            out,
+            replace,
+        } => merge(&analyses, &out, replace),
         Command::Inspect { artifact } => inspect(&artifact),
         Command::Export { artifact, out } => export(&artifact, out.as_deref()),
     };
@@ -207,6 +231,7 @@ fn analyze(
     out: &std::path::Path,
     quiet: bool,
     replace: bool,
+    thorough: bool,
 ) -> Result<(), String> {
     check_output_is_free(out, replace)?;
 
@@ -228,18 +253,20 @@ fn analyze(
     let entries = &inventory.body.outcome.entries;
     let parent = inventory.header.content_digest;
 
-    let settled = report::run_passes(entries, &mode, quiet);
+    let settled = report::run_passes(entries, &mode, quiet, thorough);
     let groups = scrub_core::analysis::group_duplicates(entries, &settled);
+    let settled: std::collections::BTreeMap<_, _> = settled.into_iter().collect();
 
     let analysis = scrub_store::Analysis {
         header: header_for(
             Stage::Analyze,
             vec![parent],
             inventory.header.scope_digest,
-            scrub_store::content_digest(&inventory.body, &groups),
+            scrub_store::analysis_digest(&inventory.body, &groups, &settled),
         )?,
         body: inventory.body,
         groups,
+        settled,
     };
 
     analysis
@@ -248,6 +275,98 @@ fn analyze(
 
     report::describe_groups(&analysis, Some(out));
     Ok(())
+}
+
+fn merge(analyses: &[PathBuf], out: &std::path::Path, replace: bool) -> Result<(), String> {
+    check_output_is_free(out, replace)?;
+    if analyses.len() < 2 {
+        return Err(
+            "merging needs at least two analyses; combining one with nothing would \
+             produce a second artifact claiming to be a comparison"
+                .to_owned(),
+        );
+    }
+
+    let mut inputs = Vec::with_capacity(analyses.len());
+    let mut parents = Vec::with_capacity(analyses.len());
+    let mut encoding = None;
+
+    for path in analyses {
+        let analysis = scrub_store::Analysis::read(path)
+            .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+        parents.push(analysis.header.content_digest);
+        encoding.get_or_insert(analysis.body.path_encoding);
+
+        inputs.push(scrub_core::merge::Input {
+            label: label_for(path),
+            machine: match analysis.header.machine {
+                MachineScope::Single { machine } => machine,
+                MachineScope::Merged { .. } => {
+                    return Err(format!(
+                        "{} is itself a comparison; merge the original analyses instead, \
+                         so every machine is counted once",
+                        path.display()
+                    ));
+                }
+            },
+            roots: analysis.body.detection.roots,
+            links: analysis.body.detection.links,
+            outcome: analysis.body.outcome,
+            settled: analysis.settled,
+        });
+    }
+
+    let merged = scrub_core::merge::merge(inputs);
+    let settled: std::collections::HashMap<_, _> = merged.settled.clone().into_iter().collect();
+    let groups = scrub_core::analysis::group_duplicates(&merged.outcome.entries, &settled);
+
+    let body = scrub_store::Body {
+        path_encoding: encoding.unwrap_or(scrub_core::paths::LOCAL),
+        detection: scrub_core::cloud::Detection {
+            roots: merged.roots.clone(),
+            links: merged.links.clone(),
+        },
+        outcome: merged.outcome.clone(),
+    };
+
+    let mut header = header_for(
+        Stage::Merge,
+        parents,
+        scrub_core::artifact::Digest::of(b"combined"),
+        scrub_core::artifact::Digest::of(b"placeholder"),
+    )?;
+    // A comparison describes several machines, so it can be read anywhere and
+    // executed nowhere (DR-18).
+    header.machine = MachineScope::Merged {
+        machines: merged.sources.iter().map(|source| source.machine).collect(),
+    };
+
+    let mut analysis = scrub_store::Analysis {
+        header,
+        body,
+        groups,
+        settled: merged.settled.clone(),
+    };
+    analysis.header.content_digest = analysis.content_digest();
+
+    analysis
+        .write(out, replacement(replace))
+        .map_err(|error| error.to_string())?;
+
+    report::describe_comparison(&merged, &analysis, out);
+    Ok(())
+}
+
+/// What to call a machine in the comparison.
+///
+/// Taken from the artifact's file name, because a machine identity is a random
+/// value that means nothing to anyone reading a report, and asking for a label
+/// every time would be a question with an obvious answer.
+fn label_for(path: &std::path::Path) -> String {
+    path.file_stem().map_or_else(
+        || path.display().to_string(),
+        |stem| stem.to_string_lossy().into_owned(),
+    )
 }
 
 fn inspect(artifact: &std::path::Path) -> Result<(), String> {

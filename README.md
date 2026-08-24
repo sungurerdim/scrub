@@ -10,10 +10,11 @@ space, and lets you design a complete reorganization before a single file moves.
 It has no delete operation. It cannot overwrite a file. It never downloads a cloud
 file without asking. Every change it makes is reversible in one step.
 
-> **Status: early development.** Stages 1 and 2 of 7 are complete: `scrub scan`
-> records a machine, and `scrub analyze` works out what is the same file as what.
-> Cross-device comparison and planning are next, and nothing writes to your files
-> yet. See [`docs/PIPELINE.md`](docs/PIPELINE.md) for the build order.
+> **Status: early development.** Stages 1 to 3 of 7 are complete: `scrub scan`
+> records a machine, `scrub analyze` works out what is the same file as what, and
+> `scrub merge` compares two machines. Planning and the write path are next, and
+> nothing touches your files yet. See [`docs/PIPELINE.md`](docs/PIPELINE.md) for
+> the build order.
 
 ---
 
@@ -86,6 +87,31 @@ cargo build --release -p scrub-cli
 ./target/release/scrub analyze scan.inventory     # what is the same as what
 ./target/release/scrub inspect scan.analysis      # summarise an artifact
 ./target/release/scrub export scan.inventory      # newline-delimited JSON
+```
+
+To compare two machines, each one scans and analyses itself, then the two
+artifacts are brought together anywhere — on either machine, or on a third that
+holds neither set of files:
+
+```bash
+# on each machine
+scrub scan && scrub analyze scan.inventory --thorough -o mac.analysis
+
+# anywhere, with both files to hand
+scrub merge mac.analysis windows.analysis
+```
+
+```
+Comparing 2 machines
+  mac                  2 of 2 files carry a fingerprint
+  windows              2 of 2 files carry a fingerprint
+
+Held in more than one place
+  1 file(s), 15 bytes of content
+
+Held in one place only
+  mac                  1 file(s) that no other machine has a copy of
+  windows              1 file(s) that no other machine has a copy of
 ```
 
 A scan opens no files at all. An analysis opens only files already on your disk,

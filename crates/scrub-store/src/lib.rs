@@ -15,12 +15,14 @@
 mod canonical;
 mod schema;
 
-pub use canonical::{content_digest, scope_digest};
+pub use canonical::{analysis_digest, content_digest, scope_digest};
 
 use std::path::Path;
 
 use rusqlite::Connection;
-use scrub_core::analysis::Group;
+use std::collections::BTreeMap;
+
+use scrub_core::analysis::{Group, Settled};
 use scrub_core::artifact::{ArtifactHeader, Digest};
 use scrub_core::cloud::Detection;
 use scrub_core::inventory::ScanOutcome;
@@ -137,13 +139,20 @@ pub struct Analysis {
     pub body: Body,
     /// Files found to hold, or possibly hold, the same content.
     pub groups: Vec<Group>,
+    /// What reading established about each entry it reached.
+    ///
+    /// Kept per entry rather than only per group, because comparing two machines
+    /// needs a fingerprint for every file that was read — including the ones
+    /// that matched nothing here. Without it a file unique on one machine could
+    /// never be recognised on another without reading everything again.
+    pub settled: BTreeMap<usize, Settled>,
 }
 
 impl Analysis {
     /// The digest of this artifact's content, in canonical form.
     #[must_use]
     pub fn content_digest(&self) -> Digest {
-        canonical::content_digest(&self.body, &self.groups)
+        canonical::analysis_digest(&self.body, &self.groups, &self.settled)
     }
 
     /// Whether this artifact's paths can be acted on by this machine.
@@ -167,6 +176,7 @@ impl Analysis {
         let transaction = connection.transaction()?;
         schema::write_body(&transaction, &self.header, &self.body)?;
         schema::write_groups(&transaction, &self.groups)?;
+        schema::write_settled(&transaction, &self.settled)?;
         transaction.commit()?;
         Ok(())
     }
@@ -189,6 +199,7 @@ impl Analysis {
             header,
             body,
             groups: schema::read_groups(&connection)?,
+            settled: schema::read_settled(&connection)?,
         };
 
         let actual = analysis.content_digest();

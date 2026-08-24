@@ -48,15 +48,40 @@ pub enum Certainty {
 /// separated from everything its size was shared with **was** read; treating it
 /// as unread in the second pass would file a settled fact under "could not
 /// check", and bury the real candidates among thousands of false ones.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Settled {
-    /// Its content was read in full and digests to this.
-    Content(Digest),
-    /// The quick pass proved it differs from everything of its size.
+    /// Its whole content was read, and digests to this.
     ///
-    /// Nothing can match it, so it forms no group — but it is settled, not
-    /// unknown.
-    DistinctBySample,
+    /// Identity, and the only thing that ever is (DR-13).
+    Content(Digest),
+    /// The sample separated it from everything of its size on this machine.
+    ///
+    /// Carries the sample digest — the two ends and the length — which is not
+    /// identity and is never used as such. It is kept because comparing two
+    /// machines starts by matching samples, and a file with no recorded
+    /// fingerprint at all could not be compared to anything without being read
+    /// again from scratch.
+    DistinctBySample(Digest),
+}
+
+impl Settled {
+    /// The content digest, where one was established.
+    #[must_use]
+    pub fn content(self) -> Option<Digest> {
+        match self {
+            Self::Content(digest) => Some(digest),
+            Self::DistinctBySample(_) => None,
+        }
+    }
+
+    /// The fingerprint recorded, whichever kind it is.
+    #[must_use]
+    pub fn fingerprint(self) -> Digest {
+        match self {
+            Self::Content(digest) | Self::DistinctBySample(digest) => digest,
+        }
+    }
 }
 
 /// Why an entry's content could not be digested.
@@ -174,6 +199,30 @@ pub fn readable_candidates(entries: &[Entry]) -> Vec<usize> {
     wanted
 }
 
+/// Every file whose content can be read here, whatever its size.
+///
+/// The mode for comparing machines. [`readable_candidates`] skips files whose
+/// size nothing else on *this* machine shares, which is right for finding local
+/// duplicates and wrong for comparison: a file unique here may well sit on the
+/// other machine, and without a fingerprint it can never be recognised there.
+///
+/// The cost is real — every file is read rather than a fraction — which is why
+/// it is a separate choice rather than the default.
+#[must_use]
+pub fn all_readable(entries: &[Entry]) -> Vec<usize> {
+    let mut wanted = Vec::new();
+    for (_, objects) in group_by_size(entries) {
+        for object in objects {
+            let first = object.names[0];
+            if !entries[first].cloud.residency.read_may_download() {
+                wanted.push(first);
+            }
+        }
+    }
+    wanted.sort_unstable();
+    wanted
+}
+
 /// Forms duplicate groups from an inventory and whatever content was digested.
 ///
 /// `digests` maps an entry index to the digest of its content. An index that is
@@ -202,7 +251,7 @@ pub fn group_duplicates<S: std::hash::BuildHasher>(
         let mut settled_count = 0;
         for object in known {
             settled_count += 1;
-            if let Settled::Content(digest) = settled[&object.names[0]] {
+            if let Some(digest) = settled[&object.names[0]].content() {
                 by_digest.entry(digest).or_default().push(object);
             }
         }
@@ -554,6 +603,24 @@ mod tests {
     }
 
     #[test]
+    fn comparing_machines_reads_files_a_local_search_would_skip() {
+        // The gap this closes. Locally, a size nothing else shares cannot be a
+        // duplicate and is never read — but the other machine may hold it, and a
+        // file with no fingerprint cannot be recognised anywhere.
+        let entries = vec![file("/a.txt", 10), file("/b.txt", 20), file("/c.txt", 30)];
+        assert!(readable_candidates(&entries).is_empty());
+        assert_eq!(all_readable(&entries), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn comparing_machines_still_refuses_to_download() {
+        // Reading everything means everything that is here, and nothing that is
+        // not (DR-11).
+        let entries = vec![file("/a.txt", 10), in_the_cloud("/cloud/b.txt", 20)];
+        assert_eq!(all_readable(&entries), vec![0]);
+    }
+
+    #[test]
     fn a_file_the_sample_ruled_out_is_settled_not_a_candidate() {
         // The trap this guards, and it is a quiet one: after the second pass
         // only the files read in full carry a content digest. Treating the rest
@@ -561,7 +628,10 @@ mod tests {
         // "could not check", turning a handful of real questions into thousands
         // of false ones and making the tier meaningless.
         let entries = vec![file("/a.bin", 9_000), file("/b.bin", 9_000)];
-        let settled = HashMap::from([(0, digest_of("same")), (1, Settled::DistinctBySample)]);
+        let settled = HashMap::from([
+            (0, digest_of("same")),
+            (1, Settled::DistinctBySample(Digest::of(b"a lonely sample"))),
+        ]);
 
         let groups = group_duplicates(&entries, &settled);
         assert!(

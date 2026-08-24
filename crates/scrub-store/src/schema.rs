@@ -13,7 +13,7 @@
 //! the size of a home-directory artifact and bought nothing.
 
 use rusqlite::{Connection, Transaction, params};
-use scrub_core::analysis::{Group, StorageObject};
+use scrub_core::analysis::{Group, Settled, StorageObject};
 use scrub_core::artifact::{ArtifactHeader, ArtifactKind, Digest, MachineScope, Stage};
 use scrub_core::cloud::{CloudRoot, CloudState, Detection, LinkVerdict, Provider, ProviderLink};
 use scrub_core::inventory::{Entry, EntryKind, FileId, ScanOutcome, Unread, UnreadReason};
@@ -270,6 +270,60 @@ pub fn write_groups(transaction: &Transaction<'_>, groups: &[Group]) -> Result<(
     Ok(())
 }
 
+/// Writes what reading established about each entry.
+pub fn write_settled(
+    transaction: &Transaction<'_>,
+    settled: &std::collections::BTreeMap<usize, Settled>,
+) -> Result<(), StoreError> {
+    let mut statement = transaction.prepare("INSERT INTO settled VALUES (?1, ?2, ?3)")?;
+    for (index, state) in settled {
+        let kind = match state {
+            Settled::Content(_) => "content",
+            Settled::DistinctBySample(_) => "sample",
+        };
+        statement.execute(params![
+            store(*index as u64),
+            kind,
+            state.fingerprint().to_hex()
+        ])?;
+    }
+    Ok(())
+}
+
+/// Reads the fingerprints back.
+pub fn read_settled(
+    connection: &Connection,
+) -> Result<std::collections::BTreeMap<usize, Settled>, StoreError> {
+    let mut statement = connection
+        .prepare("SELECT entry_index, kind, fingerprint FROM settled ORDER BY entry_index")?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut settled = std::collections::BTreeMap::new();
+    for (index, kind, fingerprint) in rows {
+        let digest = parse_digest("settled.fingerprint", &fingerprint)?;
+        let state = match kind.as_str() {
+            "content" => Settled::Content(digest),
+            "sample" => Settled::DistinctBySample(digest),
+            other => {
+                return Err(StoreError::Malformed {
+                    field: "settled.kind",
+                    detail: format!("unknown kind {other:?}"),
+                });
+            }
+        };
+        settled.insert(usize::try_from(load(index)).unwrap_or(0), state);
+    }
+    Ok(settled)
+}
+
 /// Reads the duplicate groups back.
 pub fn read_groups(connection: &Connection) -> Result<Vec<Group>, StoreError> {
     let mut statement = connection.prepare(
@@ -483,6 +537,12 @@ CREATE TABLE group_member (
 ) STRICT;
 
 CREATE INDEX group_member_by_group ON group_member (group_id);
+
+CREATE TABLE settled (
+    entry_index INTEGER NOT NULL PRIMARY KEY,
+    kind        TEXT    NOT NULL,
+    fingerprint TEXT    NOT NULL
+) STRICT;
 ";
 
 /// One row of the header table, before it becomes an [`ArtifactHeader`].

@@ -22,13 +22,20 @@ use scrub_core::inventory::UnreadReason;
 
 use crate::{ScanMode, imp};
 
-/// How much of each end a quick digest reads.
+/// How much of each end a sample reads.
 ///
 /// Large enough that two different files sharing a size are almost certainly
 /// separated by it, small enough that doing it to every candidate is cheap.
-/// Files at or under twice this are read whole, since seeking around them would
-/// cost more than reading them.
 const END_BYTES: u64 = 64 * 1024;
+
+/// The size at or below which a sample reads the whole file.
+///
+/// Seeking around a file this small costs more than reading it, so the sample
+/// reads it through — and therefore *is* its content digest, indistinguishable
+/// from what a full read would produce. That matters beyond saving a pass:
+/// comparing two machines needs a content digest for every file, and for
+/// everything under this size the sampling pass has already produced one.
+pub const SAMPLE_READS_WHOLE_FILE_UP_TO: u64 = END_BYTES * 2;
 
 /// Why content could not be read.
 #[derive(Debug, thiserror::Error)]
@@ -64,17 +71,16 @@ pub fn quick_digest(
     size: u64,
     mode: &ScanMode,
 ) -> Result<Digest, ReadRefusal> {
+    // Small enough to read through, so the sample and the content digest are the
+    // same value. Producing a different one here would throw away the only
+    // chance to learn a small file's identity for free.
+    if size <= SAMPLE_READS_WHOLE_FILE_UP_TO {
+        return full_digest(path, cloud, size, mode);
+    }
+
     let mut file = open_local(path, cloud, size, mode)?;
     let mut hasher = blake3::Hasher::new();
     hasher.update(&size.to_le_bytes());
-
-    if size <= END_BYTES * 2 {
-        let mut whole = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
-        file.read_to_end(&mut whole)
-            .map_err(|error| refusal(&error))?;
-        hasher.update(&whole);
-        return Ok(Digest::of(hasher.finalize().as_bytes()));
-    }
 
     let mut head = vec![0_u8; usize::try_from(END_BYTES).unwrap_or(usize::MAX)];
     file.read_exact(&mut head)
@@ -286,7 +292,7 @@ mod tests {
     }
 
     #[test]
-    fn a_small_file_is_read_whole_by_the_quick_pass() {
+    fn a_small_file_is_read_whole_by_the_sampling_pass() {
         let mode = crate::enter_read_only_scan_mode().expect("scan mode");
         let directory = tempfile::tempdir().expect("a temporary directory");
         let one = write(directory.path(), "one", b"short but different");
@@ -295,6 +301,42 @@ mod tests {
         assert_ne!(
             quick_digest(&one, &local(), 19, &mode).expect("digest"),
             quick_digest(&two, &local(), 19, &mode).expect("digest")
+        );
+    }
+
+    #[test]
+    fn a_small_file_samples_to_exactly_its_content_digest() {
+        // What makes comparing two machines affordable. Every file under the
+        // threshold gets a real content digest out of the cheap pass, so the
+        // expensive one is only ever needed for large files.
+        let mode = crate::enter_read_only_scan_mode().expect("scan mode");
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = write(directory.path(), "small", b"well under the threshold");
+        let size = 24;
+
+        assert_eq!(
+            quick_digest(&path, &local(), size, &mode).expect("digest"),
+            full_digest(&path, &local(), size, &mode).expect("digest"),
+            "below the threshold the two passes must agree exactly"
+        );
+    }
+
+    #[test]
+    fn a_large_file_samples_to_something_that_is_not_its_content_digest() {
+        // And above it they must not, or a sample would be mistaken for
+        // identity — which is the one thing a sample must never be (DR-13).
+        let mode = crate::enter_read_only_scan_mode().expect("scan mode");
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let size = SAMPLE_READS_WHOLE_FILE_UP_TO + 1;
+        let path = write(
+            directory.path(),
+            "large",
+            &vec![b'a'; usize::try_from(size).expect("a sane size")],
+        );
+
+        assert_ne!(
+            quick_digest(&path, &local(), size, &mode).expect("digest"),
+            full_digest(&path, &local(), size, &mode).expect("digest")
         );
     }
 }

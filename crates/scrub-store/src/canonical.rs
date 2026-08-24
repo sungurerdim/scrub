@@ -24,6 +24,26 @@ use crate::Body;
 /// inventory passes no groups, so an analysis never digests to the same value as
 /// the inventory it came from even when it found nothing.
 #[must_use]
+pub fn analysis_digest(
+    body: &Body,
+    groups: &[Group],
+    settled: &std::collections::BTreeMap<usize, scrub_core::analysis::Settled>,
+) -> Digest {
+    let mut hasher = Hasher::new();
+    field(
+        &mut hasher,
+        content_digest(body, groups).to_hex().as_bytes(),
+    );
+    section(&mut hasher, b"settled", settled.len());
+    for (index, state) in settled {
+        number(&mut hasher, *index as u64);
+        json(&mut hasher, state);
+    }
+    Digest::of(hasher.finalize().as_bytes())
+}
+
+/// The digest of an artifact's content.
+#[must_use]
 pub fn content_digest(body: &Body, groups: &[Group]) -> Digest {
     let detection = &body.detection;
     let outcome = &body.outcome;

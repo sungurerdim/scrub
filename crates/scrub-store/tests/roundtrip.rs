@@ -290,16 +290,54 @@ fn analysed() -> scrub_store::Analysis {
     ];
 
     let body = inventory.body;
-    let mut header = header(scrub_store::content_digest(&body, &groups));
+    let mut header = header(Digest::of(b"placeholder, replaced below"));
     header.stage = Stage::Analyze;
     header.kind = Stage::Analyze.output_kind();
     header.parents = vec![Digest::of(b"the inventory this came from")];
 
-    scrub_store::Analysis {
+    let settled = std::collections::BTreeMap::from([
+        (
+            0,
+            scrub_core::analysis::Settled::Content(Digest::of(b"shared content")),
+        ),
+        (
+            2,
+            scrub_core::analysis::Settled::DistinctBySample(Digest::of(b"a lonely sample")),
+        ),
+    ]);
+
+    let mut analysis = scrub_store::Analysis {
         header,
         body,
         groups,
-    }
+        settled,
+    };
+    analysis.header.content_digest = analysis.content_digest();
+    analysis
+}
+
+#[test]
+fn a_fingerprint_survives_for_every_file_that_was_read() {
+    // What makes comparing two machines possible at all. A file that matched
+    // nothing here still carries what was learned about it; dropping that would
+    // mean reading the whole disk again to compare it with anywhere else.
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let file = directory.path().join("scan.analysis");
+
+    let original = analysed();
+    original
+        .write(&file, scrub_store::Replace::Never)
+        .expect("write");
+    let recovered = scrub_store::Analysis::read(&file).expect("read");
+
+    assert_eq!(original.settled, recovered.settled);
+    assert!(
+        matches!(
+            recovered.settled.get(&2),
+            Some(scrub_core::analysis::Settled::DistinctBySample(_))
+        ),
+        "a file the sample ruled out keeps its fingerprint and its status"
+    );
 }
 
 #[test]

@@ -39,6 +39,10 @@ pedantic = { level = "warn", priority = -1 }
 # more often than it names code. This lint reads every such word as a missing
 # code span, and obeying it would put backticks around brand names.
 doc_markdown = "allow"
+# An English plural differs from its singular by one letter, so `analysis` and
+# `analyses` trip this lint every time — and renaming either would make the code
+# read worse to save a warning nobody was going to act on.
+similar_names = "allow"
 
 [profile.release]
 lto = "thin"

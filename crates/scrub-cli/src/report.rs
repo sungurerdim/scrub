@@ -116,42 +116,79 @@ impl Progress {
 
 /// Runs the two reading passes, reporting as it goes.
 ///
-/// The first reads each candidate's two ends, which separates almost everything
-/// that merely shares a size. Only what survives that is read in full — which is
-/// the difference between reading a terabyte and reading a few gigabytes of it.
+/// The first reads each candidate's two ends — its whole content, for anything
+/// small enough that seeking would cost more than reading. That separates almost
+/// everything which merely shares a size. Only what survives is read through.
 pub fn run_passes(
     entries: &[Entry],
     mode: &scrub_platform::ScanMode,
     quiet: bool,
+    thorough: bool,
 ) -> HashMap<usize, Settled> {
-    let candidates = scrub_core::analysis::readable_candidates(entries);
+    let candidates = if thorough {
+        scrub_core::analysis::all_readable(entries)
+    } else {
+        scrub_core::analysis::readable_candidates(entries)
+    };
     if !quiet {
-        println!(
-            "{} files share a size with another and can be read here.",
-            candidates.len()
-        );
+        if thorough {
+            println!(
+                "{} files can be read here, and all of them will be — \
+                 comparison needs a fingerprint for each.",
+                candidates.len()
+            );
+        } else {
+            println!(
+                "{} files share a size with another and can be read here.",
+                candidates.len()
+            );
+        }
     }
 
-    let sampled = read_pass(entries, &candidates, mode, quiet, "sampling ends", true);
-    let coarse = scrub_core::analysis::group_duplicates(entries, &sampled);
-    let confirm = scrub_core::analysis::needing_full_read(&coarse);
+    let sampled = read_pass(entries, &candidates, mode, quiet, "sampling", true);
+
+    // A file small enough to have been read through already has its content
+    // digest; a larger one has only a fingerprint, which is not identity.
+    let mut settled: HashMap<usize, Settled> = sampled
+        .iter()
+        .map(|(index, digest)| {
+            let complete = entries[*index].logical_size
+                <= scrub_platform::digest::SAMPLE_READS_WHOLE_FILE_UP_TO;
+            let settled = if complete {
+                Settled::Content(*digest)
+            } else {
+                Settled::DistinctBySample(*digest)
+            };
+            (*index, settled)
+        })
+        .collect();
+
+    // Grouping on samples decides only what is worth reading in full. Treating a
+    // sample as identity here is safe because nothing acts on the result; the
+    // groups that survive are read through before anything is concluded.
+    let provisional: HashMap<usize, Settled> = sampled
+        .iter()
+        .map(|(index, digest)| (*index, Settled::Content(*digest)))
+        .collect();
+    let confirm: Vec<usize> = scrub_core::analysis::needing_full_read(
+        &scrub_core::analysis::group_duplicates(entries, &provisional),
+    )
+    .into_iter()
+    .filter(|index| {
+        entries[*index].logical_size > scrub_platform::digest::SAMPLE_READS_WHOLE_FILE_UP_TO
+    })
+    .collect();
 
     if !quiet {
         println!(
-            "  {} still matched after sampling and are read in full.",
+            "  {} are large enough to need reading in full.",
             confirm.len()
         );
     }
-    let confirmed = read_pass(entries, &confirm, mode, quiet, "reading in full", false);
-
-    // Everything sampled counts as settled. A file the sample separated matched
-    // nothing, which is a finding rather than a gap; filing it as unread would
-    // turn a settled fact into a question (DR-14).
-    let mut settled = HashMap::with_capacity(sampled.len());
-    for index in sampled.keys() {
-        settled.insert(*index, Settled::DistinctBySample);
+    for (index, digest) in read_pass(entries, &confirm, mode, quiet, "reading", false) {
+        settled.insert(index, Settled::Content(digest));
     }
-    settled.extend(confirmed);
+
     settled
 }
 
@@ -162,7 +199,7 @@ fn read_pass(
     quiet: bool,
     label: &str,
     sample: bool,
-) -> HashMap<usize, Settled> {
+) -> HashMap<usize, scrub_core::artifact::Digest> {
     let mut digests = HashMap::with_capacity(indices.len());
     let show = !quiet && std::io::stdout().is_terminal();
     let mut last_drawn = Instant::now();
@@ -179,10 +216,10 @@ fn read_pass(
         } else {
             scrub_platform::digest::full_digest(&entry.path, &entry.cloud, entry.logical_size, mode)
         };
-        // A refusal is not a failure to report loudly here: the file simply
-        // stays unsettled, and the group it belongs to says why.
+        // A refusal is not reported loudly here: the file stays unsettled, and
+        // the group it belongs to says why.
         if let Ok(digest) = outcome {
-            digests.insert(*index, Settled::Content(digest));
+            digests.insert(*index, digest);
         }
 
         if show && last_drawn.elapsed().as_millis() >= 250 {
@@ -383,6 +420,128 @@ fn explain(reason: &UnreadReason) -> &'static str {
         UnreadReason::Vanished => "it disappeared while scanning",
         UnreadReason::Other(_) => "reported by the system",
     }
+}
+
+/// Prints what comparing several machines showed.
+///
+/// Leads with the question people actually have — is this in both places, or
+/// only one — rather than with a total. A file present on one machine only is
+/// the one worth acting on; a file present on both is the one that is safe.
+pub fn describe_comparison(
+    merged: &scrub_core::merge::Merged,
+    analysis: &Analysis,
+    written_to: &Path,
+) {
+    println!("Comparing {} machines", merged.sources.len());
+
+    // Coverage first, because everything below is only true of what was read. An
+    // analysis run without --thorough skips files whose size nothing on their
+    // own machine shares, and those cannot be recognised anywhere (DR-23).
+    let mut partial = false;
+    for source in &merged.sources {
+        let files = (source.first_entry..source.first_entry + source.entry_count)
+            .filter(|index| merged.outcome.entries[*index].kind == EntryKind::File)
+            .filter(|index| merged.outcome.entries[*index].logical_size > 0)
+            .count();
+        let fingerprinted = analysis
+            .settled
+            .keys()
+            .filter(|entry| source.contains(**entry))
+            .count();
+        partial |= fingerprinted < files;
+        println!(
+            "  {:<20} {fingerprinted} of {files} files carry a fingerprint",
+            source.label
+        );
+    }
+
+    if partial {
+        println!("\n  Files without a fingerprint were never read, so nothing below");
+        println!("  says anything about them. Re-run `analyze --thorough` on each");
+        println!("  machine to compare everything.");
+    }
+
+    let mut shared = 0_usize;
+    let mut shared_bytes = 0_u64;
+    let mut local_only = 0_usize;
+
+    for group in &analysis.groups {
+        if group.certainty != Certainty::Exact {
+            continue;
+        }
+        let names: Vec<usize> = group
+            .objects
+            .iter()
+            .flat_map(|object| object.names.clone())
+            .collect();
+        if merged.sources_among(&names).len() > 1 {
+            shared += 1;
+            shared_bytes += group.logical_size;
+        } else {
+            local_only += 1;
+        }
+    }
+
+    println!("\nHeld in more than one place");
+    println!(
+        "  {shared} file(s), {} of content",
+        human_bytes(shared_bytes)
+    );
+    println!("  {local_only} duplicate group(s) live entirely on one machine");
+
+    // What is on one machine and nowhere else. The figure people came for, and
+    // the one a tool has no business rounding off.
+    println!("\nHeld in one place only");
+    for (position, source) in merged.sources.iter().enumerate() {
+        let only_here = count_exclusive(merged, analysis, position);
+        println!(
+            "  {:<20} {} file(s) that no other machine has a copy of",
+            source.label, only_here
+        );
+    }
+
+    let unchecked = analysis
+        .groups
+        .iter()
+        .filter(|group| group.certainty == Certainty::Candidate)
+        .count();
+    if unchecked > 0 {
+        println!("\n  {unchecked} group(s) could not be checked and are counted nowhere above.");
+    }
+
+    println!("\nWritten to {}", written_to.display());
+    println!("  content digest {}", analysis.header.content_digest);
+    println!("  This is a comparison of several machines, so it can be read");
+    println!("  anywhere and applied nowhere.");
+}
+
+/// Files from one machine that no other machine holds a copy of.
+///
+/// Counted from the fingerprints rather than from the groups: a file in no group
+/// at all matched nothing anywhere, which is exactly what makes it exclusive.
+fn count_exclusive(
+    merged: &scrub_core::merge::Merged,
+    analysis: &Analysis,
+    source: usize,
+) -> usize {
+    let elsewhere: std::collections::HashSet<_> = analysis
+        .settled
+        .iter()
+        .filter(|(entry, _)| {
+            merged
+                .source_of(**entry)
+                .is_some_and(|found| found.label != merged.sources[source].label)
+        })
+        .filter_map(|(_, state)| state.content())
+        .collect();
+
+    analysis
+        .settled
+        .iter()
+        .filter(|(entry, _)| merged.sources[source].contains(**entry))
+        .filter_map(|(_, state)| state.content())
+        .filter(|digest| !elsewhere.contains(digest))
+        .count()
 }
 
 #[cfg(test)]
